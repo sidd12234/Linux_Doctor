@@ -164,7 +164,9 @@ SKIPPED. Fixes that need to download something are marked "needs internet".
 
 Examples of fixes it can offer:
   - restart a failed service
-  - free disk space (shrink the journal, clean the package cache)
+  - free disk space (shrink the journal, clean the package cache) - these
+    two are the ONLY fixes that delete anything; they are labelled
+    "DELETES", marked CARE, and never run by "a"
   - create a swap file
   - lower the priority of a CPU hog
   - fix time sync, restart the DNS resolver
@@ -182,16 +184,24 @@ GNOME DESKTOP REPAIR MENU (press g)
 -----------------------------------
 For machines with the GNOME desktop (Rocky, RHEL, Fedora, Ubuntu, Debian):
 
-  - Turn off all GNOME extensions
-  - Turn off only YOUR installed extensions (keeps Ubuntu Dock, tray icons
-    and desktop icons on Ubuntu)
+  - Turn off all GNOME extensions                               (CARE)
+  - Turn off only YOUR installed extensions - system extensions such as
+    Ubuntu's dock, tray icons and desktop icons stay on          (SAFE)
   - Reset GNOME settings (settings backed up first, old folders kept)
-  - Reinstall the core GNOME packages (on Ubuntu also Ubuntu's own desktop
-    parts: session, dock, tray, desktop icons, Yaru theme)
-  - FULL repair (the three above in a row)
-  - Restart the login screen (gdm) - ends all desktop sessions
+  - Reinstall the core GNOME packages (needs internet). On Ubuntu also
+    Ubuntu's own desktop parts (session, dock, tray, desktop icons, Yaru
+    theme), then adds any MISSING core part via ubuntu-desktop-minimal
+    without optional extras. A dry run checks first: if it would remove
+    any package, that step is skipped.
+  - FULL repair: reset settings, then extensions off (on Ubuntu only your
+    own), then reinstall
+  - Restart the login screen (gdm) - ends all desktop sessions  (RISKY)
 
-After a repair: log out and back in, then run the script again and press r.
+The per-user repairs only appear for someone really logged in to the
+desktop - never for the admin running sudo over SSH.
+
+After a repair: log out and back in, then open the fix menu again (or
+re-run the script) and press r in the menu to re-scan.
 
 To undo a settings reset (as your normal user):
      dconf load / < ~/gnome-settings-backup_<date>.ini
@@ -200,21 +210,27 @@ To undo a settings reset (as your normal user):
 ZOMBIE PROCESSES
 ----------------
 Zombies are cleaned up AUTOMATICALLY when the script runs as root:
-  1. the parent application is asked to clean up (harmless)
-  2. its service is restarted (60 second limit)
+  1. the parent application is asked to clean up (harmless, no question)
+  2. its service is restarted - only after you confirm (60 second limit)
   3. the parent is stopped - only after you confirm
 
-Never touched: this script's own terminal, sudo and SSH session, login
-sessions, the desktop session, containers and core services. In cron runs
-(no keyboard) only step 1 is done.
+Never touched: this script's own terminal, sudo and SSH session, the
+process that holds a login session, the desktop session, containers and
+core services. Other jobs inside a session (e.g. cron or nohup jobs) go
+to the questions in steps 2-3. In cron runs (no keyboard) only step 1 is
+done.
 
 Use --no-zombie-kill for a strictly read-only run.
 
 
 INTERNET
 --------
-Most checks and fixes work fully offline. Only these need the internet:
-security updates, firmware updates, and installing a missing package.
+Most checks and fixes work fully offline. These need the internet (they
+are marked "needs internet" in the menu):
+  - installing security updates, and the update check on RHEL/Rocky/SUSE
+  - checking for and installing firmware updates (fwupd), installing fwupd
+  - installing lm-sensors (fan sensors) and kdump (crash capture)
+  - reinstalling the GNOME / Ubuntu desktop packages (and FULL repair)
 
 If the internet is needed and missing, the script shows what to do
 (cable, Wi-Fi, VPN, proxy) and WAITS - it never exits. As soon as you are
@@ -243,8 +259,11 @@ A re-scan writes a new report; the earlier one is kept.
 
 SAFETY
 ------
-  - Apart from zombie cleanup, the checks only read - nothing is changed.
-  - Nothing is ever deleted. Old folders are renamed to *.old_<date>.
+  - Apart from the zombie nudge, the checks only read - nothing is changed.
+  - Only two fixes delete anything, both labelled "DELETES", marked CARE
+    and never run by "a": shrinking the journal (oldest logs) and cleaning
+    the package cache (downloadable again). Everything else deletes
+    nothing - old folders are renamed to *.old_<date>.
   - Config files a fix edits directly (fstab, /etc/hosts, firewall rules,
     boot config) are backed up first as <file>.backupN_<date>.
   - Fixes only run when you choose them; RISKY fixes ask twice.
@@ -256,7 +275,7 @@ EXIT CODES (for cron / monitoring)
 ----------------------------------
   0   healthy
   1   warnings only
-  2   critical problems still open
+  2   a critical problem is still open, or the health score is below 60
 
 
 FILES IN THIS FOLDER
