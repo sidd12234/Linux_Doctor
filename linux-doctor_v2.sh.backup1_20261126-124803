@@ -1,0 +1,1646 @@
+#!/usr/bin/env bash
+# =============================================================================
+#
+#   L I N U X   D O C T O R   —   linux-doctor_v2.sh
+#
+#   Crafted with love by MUHAMMAD ALI SIDDIQUI
+#
+#   One-shot Linux troubleshooting & health report. Reads the logs, checks the
+#   hardware and the OS, hunts down the cause of freezes / hangs / zombies,
+#   explains every problem in plain English, lets you pick fixes from a menu,
+#   verifies each fix, and writes a visual HTML report: problem -> evidence ->
+#   fix -> result.
+#
+#   Works on:
+#     Debian family : Debian, Ubuntu, Mint, Kali, Pop!_OS, Raspberry Pi OS ...
+#     RedHat family : RHEL, CentOS, Rocky, AlmaLinux, Fedora, Oracle, Amazon
+#     SUSE / others : best effort (every check skips itself if a tool is missing)
+#
+#   Sections:
+#      1. System overview            8. Services & boot
+#      2. CPU                        9. Log scan (errors explained)
+#      3. Memory                    10. Network & DNS
+#      4. Disk & filesystems        11. System freezes & hangs (root cause)
+#      5. Storage hardware          12. Security & updates
+#      6. Cooling, fans & battery   13. Recent changes (what changed before it broke)
+#      7. Processes & zombies
+#
+#   Usage:  sudo bash linux-doctor_v2.sh [options]
+#      (no option)  diagnose; at the end you are asked if you want the fix menu
+#      --fix        go straight to the fix menu after the report
+#      --no-fix     never show the fix menu (good for cron)
+#      --quick      skip slow checks (SMART, update queries, iostat, du)
+#      --hours N    how far back to read logs (default 24)
+#      --out DIR    where to save reports (default /var/log/linux-doctor)
+#      --no-color   plain output (also: NO_COLOR env var, or output to a pipe)
+#      --no-anim    no intro animation
+#      --ascii      no Unicode symbols / emoji (for old consoles)
+#      -h, --help   show help
+#
+#   Safety: diagnosis is read-only and never deletes anything. Fixes only run
+#   when you select them; RISKY fixes ask a second time. Any config file a fix
+#   changes is backed up first as <file>.backupN_YYYYMMDD-HHMMSS.
+#
+#   Exit code: 0 healthy, 1 warnings, 2 critical (after fixes) - cron friendly.
+# =============================================================================
+
+set -uo pipefail                                   # unset variable = error; failing pipe part is noticed (no -e: one failed check must not stop the run)
+unset LC_ALL                                       # let the per-category locale settings below take effect
+export LC_NUMERIC=C LC_MESSAGES=C                  # dot decimals + English tool output, so parsing works everywhere
+
+# ----------------------------------------------------------------------------
+#  Defaults & command-line options
+# ----------------------------------------------------------------------------
+VERSION="2.0"                                      # script version
+AUTHOR="MUHAMMAD ALI SIDDIQUI"                     # author credit
+FIX_MODE=0                                         # 0 = ask at the end, 1 = open fix menu directly, -1 = never
+QUICK=0                                            # 1 = skip slow checks
+HOURS=24                                           # log look-back window in hours
+USE_COLOR=1                                        # 1 = colored output
+FORCE_ASCII=0                                      # 1 = no Unicode
+NO_ANIM=0                                          # 1 = no intro animation
+OUT_DIR="/var/log/linux-doctor"                    # default report folder
+TOTAL_STEPS=13                                     # number of check sections
+
+usage() {                                          # print the help text
+  cat <<EOF
+Linux Doctor v${VERSION} - crafted with love by ${AUTHOR}
+
+Usage: sudo bash $0 [options]
+  (none)       diagnose, then ask whether to open the fix menu
+  --fix        open the fix menu right after the report
+  --no-fix     never show the fix menu (cron / automation)
+  --quick      skip slow checks (SMART, update queries, iostat, du)
+  --hours N    how far back to read logs (default 24)
+  --out DIR    where to save reports (default /var/log/linux-doctor)
+  --no-color   plain output
+  --no-anim    no intro animation
+  --ascii      no Unicode symbols / emoji
+  -h, --help   this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do                           # walk through every argument
+  case "$1" in
+    --fix)      FIX_MODE=1 ;;                      # open fix menu directly
+    --no-fix)   FIX_MODE=-1 ;;                     # never offer fixes
+    --quick)    QUICK=1 ;;                         # quick mode
+    --hours)    shift; HOURS="${1:-}"              # next argument = hours
+                [[ "$HOURS" =~ ^[0-9]+$ && "$HOURS" -gt 0 ]] || { echo "--hours needs a positive number"; exit 2; } ;;
+    --out)      shift; OUT_DIR="${1:-}"            # custom report folder
+                [[ -n "$OUT_DIR" ]] || { echo "--out needs a folder"; exit 2; } ;;
+    --no-color) USE_COLOR=0 ;;                     # no colors
+    --no-anim)  NO_ANIM=1 ;;                       # no animation
+    --ascii)    FORCE_ASCII=1 ;;                   # no Unicode
+    -h|--help)  usage; exit 0 ;;                   # help
+    *)          echo "Unknown option: $1"; usage; exit 2 ;;
+  esac
+  shift                                            # next argument
+done
+
+# ----------------------------------------------------------------------------
+#  Look & feel: colors, symbols, terminal width
+# ----------------------------------------------------------------------------
+[[ -t 1 && -z "${NO_COLOR:-}" ]] || USE_COLOR=0    # no colors when not on a terminal or NO_COLOR is set
+(( USE_COLOR )) || NO_ANIM=1                       # no animation without colors
+
+UTF=0                                              # assume ASCII until proven otherwise
+case "${LC_CTYPE:-}${LANG:-}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UTF=1 ;; esac   # UTF-8 locale?
+(( FORCE_ASCII )) && UTF=0                         # user asked for ASCII
+
+INTERACTIVE=0                                      # can we ask the user questions?
+{ : </dev/tty; } 2>/dev/null && INTERACTIVE=1      # yes if a terminal can be opened (not in cron)
+
+COLS=$( { stty size </dev/tty; } 2>/dev/null | awk '{print $2}')   # terminal width (silent if no terminal)
+[[ "$COLS" =~ ^[0-9]+$ ]] || COLS=${COLUMNS:-110}  # fallback
+
+if (( USE_COLOR )); then                           # ANSI color codes
+  R=$'\e[0m'; B=$'\e[1m'; DIM=$'\e[2m'; ITA=$'\e[3m'               # reset, bold, dim, italic
+  RED=$'\e[38;5;196m'; GRN=$'\e[38;5;46m'; YEL=$'\e[38;5;220m'      # status colors
+  BLU=$'\e[38;5;39m';  CYN=$'\e[38;5;51m'; MAG=$'\e[38;5;201m'      # accents
+  GRY=$'\e[38;5;245m'; ORG=$'\e[38;5;208m'; PNK=$'\e[38;5;213m'; RAILC=$'\e[38;5;240m'
+  BG_RED=$'\e[48;5;52m'; BG_GRN=$'\e[48;5;22m'; BG_YEL=$'\e[48;5;58m'; BG_BLU=$'\e[48;5;17m'   # badge backgrounds
+else
+  R=""; B=""; DIM=""; ITA=""; RED=""; GRN=""; YEL=""; BLU=""; CYN=""; MAG=""; GRY=""; ORG=""; PNK=""; RAILC=""
+  BG_RED=""; BG_GRN=""; BG_YEL=""; BG_BLU=""
+fi
+GRAD=(51 45 39 33 63 99 135 171 207 213 219 225 231)   # banner/header gradient cyan -> magenta
+RAMP=(46 82 118 154 190 226 220 214 208 202 196)        # meter gradient green -> red
+c256() { (( USE_COLOR )) && printf '\e[38;5;%sm' "$1"; return 0; }   # print one 256-color code
+
+if (( UTF )); then                                 # Unicode symbols
+  S_OK="✔"; S_WARN="⚠"; S_FAIL="✖"; S_INFO="➜"; S_FIX="🛠"; S_TIP="💡"; S_DOT="•"; S_EVI="🔎"
+  BAR_F="█"; BAR_E="░"; HL="━"; PG_F="▰"; PG_E="▱"; RAIL="│"
+  BX_TL="╭"; BX_TR="╮"; BX_BL="╰"; BX_BR="╯"; BX_H="─"; BX_V="│"
+  DB_TL="╔"; DB_BL="╚"; DB_H="═"; DB_V="║"
+  SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  STEP_ICON=("" "💻" "⚡" "🧠" "💾" "🔩" "🌀" "🧟" "🚀" "📜" "🌐" "🧊" "🔒" "🕒")
+  I_HOST="💻"; I_OS="🐧"; I_KER="🧬"; I_UP="⏰"; I_NET="🌐"; I_VM="📦"; I_CPU="⚡"; I_MEM="🧠"; I_FAN="🌀"; I_BAT="🔋"; I_TMP="🌡 "
+else                                               # ASCII fallbacks
+  S_OK="[OK]"; S_WARN="[!]"; S_FAIL="[X]"; S_INFO="->"; S_FIX="*"; S_TIP="i"; S_DOT="-"; S_EVI=">"
+  BAR_F="#"; BAR_E="."; HL="="; PG_F="#"; PG_E="-"; RAIL="|"
+  BX_TL="+"; BX_TR="+"; BX_BL="+"; BX_BR="+"; BX_H="-"; BX_V="|"
+  DB_TL="+"; DB_BL="+"; DB_H="="; DB_V="|"
+  SPIN=('|' '/' '-' '\')
+  STEP_ICON=("" "" "" "" "" "" "" "" "" "" "" "" "" "")
+  I_HOST="  "; I_OS="  "; I_KER="  "; I_UP="  "; I_NET="  "; I_VM="  "; I_CPU="  "; I_MEM="  "; I_FAN="  "; I_BAT="  "; I_TMP="  "
+fi
+HICON=("" "💻" "⚡" "🧠" "💾" "🔩" "🌀" "🧟" "🚀" "📜" "🌐" "🧊" "🔒" "🕒")   # icons for the HTML report (always emoji)
+PFX="  ${RAILC}${RAIL}${R} "                       # left rail printed in front of every line inside a section
+
+# ----------------------------------------------------------------------------
+#  Small helpers
+# ----------------------------------------------------------------------------
+has_cmd() { command -v "$1" >/dev/null 2>&1; }     # is a tool installed?
+to() { if has_cmd timeout; then timeout "$@"; else shift; "$@"; fi; }   # run with a time limit if possible
+rep() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }  # repeat a string N times
+num() { [[ "${1:-}" =~ ^[0-9]+$ ]] && echo "$1" || echo 0; }            # sanitize to an integer
+cnt() { local n; n=$(grep -Eic -- "$1" "$2" 2>/dev/null); echo "${n:-0}"; }   # count matching lines (case-insensitive)
+rd()  { cat "$1" 2>/dev/null; }                    # read a small /sys or /proc file quietly
+human_kb() { awk -v k="${1:-0}" 'BEGIN{u="KMGTP";i=1;while(k>=1024&&i<5){k/=1024;i++};printf "%.1f%s",k,substr(u,i,1)}'; }   # KB -> 1.2G
+dur_h() { local s=$(num "$1"); if ((s>=86400)); then echo "$((s/86400))d $((s%86400/3600))h"; elif ((s>=3600)); then echo "$((s/3600))h $((s%3600/60))m"; elif ((s>=60)); then echo "$((s/60))m $((s%60))s"; else echo "${s}s"; fi; }   # seconds -> 2h 5m
+indent() { awk -v p="$PFX" -v w="$(( COLS > 40 ? COLS - 4 : 116 ))" '{print p substr($0,1,w)}'; }   # rail-prefix + trim piped text
+
+bk() {                                             # back up a file as <file>.backupN_YYYYMMDD-HHMMSS (next free N), never overwrites
+  local f=$1 n=1
+  [[ -e $f ]] || return 0                          # nothing to back up
+  while compgen -G "${f}.backup${n}_*" >/dev/null; do n=$((n+1)); done   # find the next free number
+  cp -p "$f" "${f}.backup${n}_$(date +%Y%m%d-%H%M%S)" && echo "backup created: ${f}.backup${n}_*"
+}
+
+# ---- result storage ----------------------------------------------------------
+N_CRIT=0; N_WARN=0; N_OK=0; N_INFO=0               # global counters
+F_SEV=(); F_AREA=(); F_STEP=(); F_MSG=(); F_HINT=(); F_EVID=(); F_STATUS=()   # findings
+FX_F=(); FX_TITLE=(); FX_CMD=(); FX_VERIFY=(); FX_RISK=(); FX_STATUS=(); FX_TIME=(); FX_OUT=()   # fixes (linked to findings)
+M_AREA=(); M_LABEL=(); M_VAL=(); M_EXTRA=(); M_INV=()                         # meters
+S_C=(); S_W=(); S_O=()                             # per-section counts (critical / warning / ok)
+STEP_TITLES=(); CUR_AREA="General"; STEP_NO=0      # section bookkeeping
+FAN_L=(); FAN_R=(); TEMP_L=(); TEMP_C=(); TEMP_X=(); BAT_JSON="null"   # cooling data for HTML
+ZB_PP=(); ZB_APP=(); ZB_CMD=(); ZB_UNIT=(); ZB_CNT=(); ZB_OLD=(); ZB_PKG=(); ZB_USER=()   # zombie parents for HTML
+VIRT="unknown"; UP_H="?"; IS_LAPTOP=0              # filled in by the checks
+SCORE=100; SCORE_AFTER=100; FIXES_RUN=0            # health scores
+declare -A FZ=([io]=0 [mem]=0 [cpu]=0 [kernel]=0 [nfs]=0 [hw]=0 [limits]=0)   # freeze-cause evidence points
+declare -A FZ_TXT=(
+  [io]="STORAGE: disks are slow, failing or timing out - everything freezes while waiting for the disk"
+  [mem]="MEMORY: RAM runs out, the system swaps/thrashes and the OOM killer steps in"
+  [cpu]="CPU: overloaded CPUs or an overcommitted VM host starve everything else"
+  [kernel]="KERNEL/DRIVER: lockups, crashes or unclean resets point to a kernel, driver or firmware bug"
+  [nfs]="NETWORK STORAGE: an NFS/CIFS server stops answering and every process touching it hangs"
+  [hw]="HARDWARE: overheating, stopped fans or CPU/RAM errors are destabilizing the machine"
+  [limits]="LIMITS: process, file or connection tables are full, so new work cannot start"
+)
+FZ_ORDER=()                                        # freeze causes ranked (filled in step 11)
+
+# ---- output primitives (all lines inside a section get the rail prefix) -----
+ok()   { printf '%s%s%s%s %s\n' "$PFX" "$GRN" "$S_OK" "$R" "$*"; }              # green tick line
+good() { ok "$@"; N_OK=$((N_OK+1)); S_O[STEP_NO]=$(( ${S_O[STEP_NO]:-0} + 1 )); }   # tick that counts as a passed check
+info() { printf '%s%s%s%s %s\n' "$PFX" "$BLU" "$S_INFO" "$R" "$*"; }           # blue info line
+note() { printf '%s  %s%s%s\n' "$PFX" "$GRY" "$*" "$R"; }                       # grey detail line
+kv()   { printf '%s%s%-20s%s %s\n' "$PFX" "$GRY" "$1" "$R" "$2"; }              # label / value line
+skip() { printf '%s%s%s skipped:%s %s%s%s\n' "$PFX" "$GRY" "$S_DOT" "$R" "$DIM" "$*" "$R"; }   # skipped check
+sub()  { printf '%s\n%s%s%s %s%s\n' "$PFX" "$PFX" "$CYN$B" "$S_DOT" "$*" "$R"; }  # sub-heading
+table_head() { printf '%s%s%s%s\n' "$PFX" "$MAG$B" "$*" "$R"; }                # table header row
+table_rows() { indent; }                           # table body rows
+
+add_finding() {                                    # record + print a problem: SEV(CRIT|WARN|INFO) MESSAGE HINT [EVIDENCE]
+  local sev=$1 msg=$2 hint=${3:-} evid=${4:-}
+  F_SEV+=("$sev"); F_AREA+=("$CUR_AREA"); F_STEP+=("$STEP_NO"); F_MSG+=("$msg"); F_HINT+=("$hint"); F_EVID+=("$evid"); F_STATUS+=("OPEN")
+  case $sev in
+    CRIT) printf '%s%s %s CRITICAL %s %s%s%s\n' "$PFX" "$BG_RED$RED$B" "$S_FAIL" "$R" "$RED$B" "$msg" "$R"
+          N_CRIT=$((N_CRIT+1)); S_C[STEP_NO]=$(( ${S_C[STEP_NO]:-0} + 1 )) ;;
+    WARN) printf '%s%s %s WARNING %s %s%s%s\n' "$PFX" "$BG_YEL$YEL$B" "$S_WARN" "$R" "$YEL" "$msg" "$R"
+          N_WARN=$((N_WARN+1)); S_W[STEP_NO]=$(( ${S_W[STEP_NO]:-0} + 1 )) ;;
+    *)    printf '%s%s %s TIP %s %s\n' "$PFX" "$BG_BLU$CYN$B" "$S_TIP" "$R" "$msg"; N_INFO=$((N_INFO+1)) ;;
+  esac
+  if [[ -n $evid ]]; then                          # show the evidence (max 4 lines)
+    printf '%s     %s%s Evidence:%s\n' "$PFX" "$GRY" "$S_EVI" "$R"
+    printf '%s\n' "$evid" | head -4 | awk -v p="$PFX" -v c="$DIM" -v r="$R" '{print p "       " c substr($0,1,110) r}'
+  fi
+  [[ -n $hint ]] && printf '%s     %s%s Fix:%s %s\n' "$PFX" "$YEL" "$S_FIX" "$R" "$hint"   # how to fix it
+  return 0
+}
+
+add_fix() {                                        # offer an automatic fix for the LAST finding: TITLE COMMAND VERIFY RISK(safe|care|risky)
+  FX_F+=($(( ${#F_SEV[@]} - 1 ))); FX_TITLE+=("$1"); FX_CMD+=("$2"); FX_VERIFY+=("${3:-}"); FX_RISK+=("${4:-safe}")
+  FX_STATUS+=("OPEN"); FX_TIME+=(""); FX_OUT+=("")
+  printf '%s     %s%s auto-fix #%d available:%s %s %s(%s)%s\n' "$PFX" "$GRN" "$S_INFO" "${#FX_CMD[@]}" "$R" "$1" "$GRY" "${4:-safe}" "$R"
+}
+
+grad_bar() {                                       # gradient bar: PERCENT WIDTH [INVERT]
+  local pct=$1 w=$2 inv=${3:-0} fill j ci out=""
+  (( pct > 100 )) && pct=100
+  fill=$(( pct * w / 100 ))
+  if (( USE_COLOR )); then
+    for ((j=0; j<w; j++)); do
+      if (( j < fill )); then
+        ci=$(( j * 10 / (w - 1) )); (( inv )) && ci=$(( 10 - ci ))   # color by position: green -> red (or reversed)
+        out+=$'\e[38;5;'"${RAMP[ci]}m${BAR_F}"
+      else out+="${RAILC}${BAR_E}"; fi
+    done
+    out+=$R
+  else out="$(rep "$BAR_F" "$fill")$(rep "$BAR_E" $((w - fill)))"; fi
+  printf '%s' "$out"
+}
+
+meter() {                                          # labelled gradient meter: LABEL PERCENT [EXTRA] [INVERT: high=good]
+  local label=$1 pct extra=${3:-} inv=${4:-0} col bad
+  pct=$(num "${2%.*}")
+  bad=$pct; (( inv )) && bad=$(( 100 - pct ))      # how "bad" the value is
+  if   (( bad >= 90 )); then col=$RED
+  elif (( bad >= 70 )); then col=$YEL
+  else col=$GRN; fi
+  printf '%s%-18.18s %s %s%4d%%%s  %s%s%s\n' "$PFX" "$label" "$(grad_bar "$pct" 30 "$inv")" "$col$B" "$pct" "$R" "$GRY" "$extra" "$R"
+  M_AREA+=("$CUR_AREA"); M_LABEL+=("$label"); M_VAL+=("$pct"); M_EXTRA+=("$extra"); M_INV+=("$inv")
+}
+
+step_end() {                                       # close the current section with its mini score line
+  (( STEP_NO == 0 )) && return 0
+  local c=${S_C[STEP_NO]:-0} w=${S_W[STEP_NO]:-0} o=${S_O[STEP_NO]:-0}
+  printf '  %s%s%s%s %s%s %d passed%s  %s%s %d warning%s  %s%s %d critical%s\n' "$RAILC" "$BX_BL" "$(rep "$BX_H" 2)" "$R" \
+    "$GRN" "$S_OK" "$o" "$R" "$YEL" "$S_WARN" "$w" "$R" "$RED" "$S_FAIL" "$c" "$R"
+}
+
+step() {                                           # big gradient section header with progress bar
+  step_end                                         # close the previous section
+  STEP_NO=$((STEP_NO + 1)); CUR_AREA=$1; STEP_TITLES+=("$1")
+  S_C[STEP_NO]=0; S_W[STEP_NO]=0; S_O[STEP_NO]=0
+  local icon=${STEP_ICON[$STEP_NO]:-} title=${1^^} done pad hdr="" j t
+  done=$(( STEP_NO * 10 / TOTAL_STEPS )); pad=$(( 46 - ${#title} )); (( pad < 3 )) && pad=3
+  t="$(rep "$HL" 3) [${STEP_NO}/${TOTAL_STEPS}] "   # text that gets the gradient
+  if (( USE_COLOR )); then
+    for ((j=0; j<${#t}; j++)); do hdr+="$(c256 "${GRAD[$(( (j + STEP_NO) % 12 ))]}")${t:j:1}"; done   # rainbow sweep, shifted per section
+  else hdr=$t; fi
+  echo
+  printf '  %s%s%s%s %s %s%s%s %s%s%s %3d%%%s\n' "$RAILC" "$BX_TL" "$R" "$B$hdr" "$icon" "$(c256 "${GRAD[$(( STEP_NO % 12 ))]}")$B" "$title" \
+    " $(rep "$HL" "$pad")$R" "$CYN" "$(rep "$PG_F" "$done")" "$RAILC$(rep "$PG_E" $((10 - done)))" $(( STEP_NO * 100 / TOTAL_STEPS )) "$R"
+}
+
+SPIN_N=0; SPIN_OUT=""; SPIN_RC=0                   # spinner state
+run_spin() {                                       # run a slow command with a spinner: MESSAGE CMD [ARGS...]
+  local msg=$1; shift
+  SPIN_N=$((SPIN_N + 1))
+  local f="$EVID/cmd_${SPIN_N}.out" i=0 pid t0=$SECONDS   # command output kept as evidence
+  "$@" >"$f" 2>&1 &                                # start in the background
+  pid=$!
+  if [[ -t 2 ]] && (( USE_COLOR )); then           # animate only on a real terminal
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r  %s%s%s %s%s%s %s(%ds)%s ' "$CYN" "${SPIN[i++ % ${#SPIN[@]}]}" "$R" "$DIM" "$msg" "$R" "$GRY" $((SECONDS - t0)) "$R" >&2
+      sleep 0.1                                    # 10 frames per second
+    done
+    printf '\r\e[K' >&2                            # clear the spinner line
+  fi
+  wait "$pid"; SPIN_RC=$?                          # exit code of the command
+  SPIN_OUT=$(<"$f")                                # its output
+}
+
+ask() {                                            # yes/no question from the keyboard (prompt on screen only)
+  local a=""
+  printf '  %s%s [y/N]%s ' "$CYN$B" "$1" "$R" >&2
+  read -r a </dev/tty 2>/dev/null || a=""
+  [[ $a =~ ^[Yy] ]]
+}
+
+# ----------------------------------------------------------------------------
+#  Pre-flight: who am I, which distro, where do logs live, where to save
+# ----------------------------------------------------------------------------
+IS_ROOT=0; [[ $EUID -eq 0 ]] && IS_ROOT=1          # running as root?
+
+OS_ID="unknown"; OS_LIKE=""; OS_NAME="$(uname -s)"
+if [[ -r /etc/os-release ]]; then                  # standard distro identification
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID=${ID:-unknown}; OS_LIKE=${ID_LIKE:-}; OS_NAME=${PRETTY_NAME:-${NAME:-Linux}}
+elif [[ -r /etc/redhat-release ]]; then            # very old RedHat
+  OS_ID="rhel"; OS_NAME=$(</etc/redhat-release)
+fi
+case " $OS_ID $OS_LIKE " in                        # distro family
+  *" debian "*|*" ubuntu "*|*" raspbian "*|*" linuxmint "*|*" pop "*|*" kali "*) FAMILY="debian" ;;
+  *" rhel "*|*" fedora "*|*" centos "*|*" rocky "*|*" almalinux "*|*" ol "*|*" amzn "*) FAMILY="rhel" ;;
+  *" suse "*|*" sles "*|*" opensuse"*) FAMILY="suse" ;;
+  *) FAMILY="other" ;;
+esac
+PKG="none"; for p in apt-get dnf yum zypper; do has_cmd "$p" && { PKG=$p; break; }; done   # package manager
+
+SYSLOG=""; AUTHLOG=""                              # classic text logs
+for f in /var/log/syslog /var/log/messages; do [[ -r $f ]] && { SYSLOG=$f; break; }; done
+for f in /var/log/auth.log /var/log/secure; do [[ -r $f ]] && { AUTHLOG=$f; break; }; done
+HAS_JOURNAL=0; has_cmd journalctl && journalctl -n 1 -q --no-pager >/dev/null 2>&1 && HAS_JOURNAL=1   # journal readable?
+HAS_SYSTEMD=0; [[ -d /run/systemd/system ]] && HAS_SYSTEMD=1   # systemd running?
+SINCE="${HOURS} hours ago"                         # journal window
+
+HOST=$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname)   # machine name
+TS=$(date +%Y%m%d-%H%M%S)                          # timestamp
+if ! mkdir -p "$OUT_DIR" 2>/dev/null || [[ ! -w $OUT_DIR ]]; then   # report folder writable?
+  OUT_DIR="${HOME:-/tmp}/linux-doctor-reports"; mkdir -p "$OUT_DIR" 2>/dev/null || OUT_DIR="/tmp"
+fi
+BASE="$OUT_DIR/linux-doctor_${HOST}_${TS}"         # file prefix
+TXT="$BASE.txt"; HTML="$BASE.html"; EVID="${BASE}_evidence"   # outputs
+mkdir -p "$EVID"                                   # evidence folder
+RAW="$EVID/terminal-output.ansi"                   # colored copy of the screen (less -R)
+KLOG="$EVID/kernel.log"; ERRLOG="$EVID/errors.log"; AUTHL="$EVID/auth.log"   # log extracts
+
+exec 3>&1                                          # keep the real screen on fd 3
+exec > >(tee -a "$RAW")                            # everything printed is also saved
+TEE_PID=${!:-}                                     # tee's PID (to wait for it at the end)
+START_SEC=$SECONDS                                 # start time
+
+# ============================================================================
+#  BANNER (animated on a real terminal)
+# ============================================================================
+banner() {
+  local d=0; (( NO_ANIM )) || d=0.04              # delay between banner lines
+  echo
+  if (( UTF )) && (( COLS >= 96 )); then          # big block letters
+    local L=(
+"██╗     ██╗███╗   ██╗██╗   ██╗██╗  ██╗  ██████╗  ██████╗  ██████╗████████╗ ██████╗ ██████╗ "
+"██║     ██║████╗  ██║██║   ██║╚██╗██╔╝  ██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗"
+"██║     ██║██╔██╗ ██║██║   ██║ ╚███╔╝   ██║  ██║██║   ██║██║        ██║   ██║   ██║██████╔╝"
+"██║     ██║██║╚██╗██║██║   ██║ ██╔██╗   ██║  ██║██║   ██║██║        ██║   ██║   ██║██╔══██╗"
+"███████╗██║██║ ╚████║╚██████╔╝██╔╝ ██╗  ██████╔╝╚██████╔╝╚██████╗   ██║   ╚██████╔╝██║  ██║"
+"╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝  ╚═════╝  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝"
+    )
+    local i; for i in "${!L[@]}"; do printf '  %s%s%s\n' "$(c256 "${GRAD[$((i+1))]}")$B" "${L[$i]}" "$R"; [[ $d != 0 ]] && sleep "$d"; done
+  elif (( UTF )); then                             # compact letters
+    local L=("╦  ╦╔╗╔╦ ╦═╗ ╦  ╔╦╗╔═╗╔═╗╔╦╗╔═╗╦═╗" "║  ║║║║║ ║╔╩╦╝   ║║║ ║║   ║ ║ ║╠╦╝" "╩═╝╩╝╚╝╚═╝╩ ╚═  ═╩╝╚═╝╚═╝ ╩ ╚═╝╩╚═")
+    local i; for i in "${!L[@]}"; do printf '  %s%s%s\n' "$(c256 "${GRAD[$((i*3))]}")$B" "${L[$i]}" "$R"; [[ $d != 0 ]] && sleep "$d"; done
+  else
+    printf '  %s==============  L I N U X   D O C T O R  ==============%s\n' "$CYN$B" "$R"
+  fi
+  if (( UTF )); then                               # heartbeat line
+    printf '  %s──────────────────────╮%s╭╮%s╭─────────╯╰──╮╭───────────────── %sv%s%s\n' "$RAILC" "$RED$B" "$RAILC" "$GRY" "$VERSION" "$R"
+    printf '  %s                      ╰╯ ╰╯              ╰╯%s\n' "$RED" "$R"
+  fi
+  local w=62                                       # credit box
+  printf '  %s%s%s%s%s\n' "$PNK" "$BX_TL" "$(rep "$BX_H" "$w")" "$BX_TR" "$R"
+  printf '  %s%s%s  %s%-58s%s  %s%s%s\n' "$PNK" "$BX_V" "$R" "$B" "Crafted with love by $AUTHOR" "$R" "$PNK" "$BX_V" "$R"
+  printf '  %s%s%s  %s%-58s%s  %s%s%s\n' "$PNK" "$BX_V" "$R" "$GRY" "Linux Doctor v$VERSION  -  find it, explain it, fix it" "$R" "$PNK" "$BX_V" "$R"
+  printf '  %s%s%s%s%s\n' "$PNK" "$BX_BL" "$(rep "$BX_H" "$w")" "$BX_BR" "$R"
+  if (( ! NO_ANIM )); then                         # short "booting" progress animation (screen only)
+    local k; for ((k=1; k<=30; k++)); do printf '\r  %sInitializing diagnostics%s %s ' "$GRY" "$R" "$(grad_bar $((k*100/30)) 30)" >&2; sleep 0.015; done
+    printf '\r\e[K' >&2
+  fi
+  echo
+  local mode="diagnose only (read-only)"
+  (( FIX_MODE == 1 )) && mode="diagnose + fix menu"; (( FIX_MODE == 0 && INTERACTIVE )) && mode="diagnose, then offer the fix menu"
+  (( QUICK )) && mode+=", quick"
+  printf '  %s%-16s%s %s\n' "$GRY" "Started" "$R" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  printf '  %s%-16s%s last %s hours\n' "$GRY" "Log window" "$R" "$HOURS"
+  printf '  %s%-16s%s %s\n' "$GRY" "Mode" "$R" "$mode"
+  printf '  %s%-16s%s %s (package manager: %s)\n' "$GRY" "Distro family" "$R" "$FAMILY" "$PKG"
+  printf '  %s%-16s%s %s\n' "$GRY" "Reports to" "$R" "$OUT_DIR"
+  if (( ! IS_ROOT )); then
+    echo
+    printf '  %s%s Not running as root%s - some checks (logs, SMART, firewall) are limited and fixes are disabled.\n' "$YEL$B" "$S_WARN" "$R"
+    printf '  %s  For the full picture run:  sudo bash %s%s\n' "$GRY" "$0" "$R"
+  fi
+}
+
+# ============================================================================
+#  LOG COLLECTION (once; all sections reuse the extracts)
+# ============================================================================
+collect_logs() {
+  if (( HAS_JOURNAL )); then journalctl -k --since "$SINCE" --no-pager -q -o short-iso >"$KLOG" 2>/dev/null; fi   # kernel log for the window
+  [[ -s $KLOG ]] || dmesg -T >"$KLOG" 2>/dev/null || dmesg >"$KLOG" 2>/dev/null                                  # ring buffer fallback
+  if [[ ! -s $KLOG ]]; then for f in /var/log/kern.log /var/log/messages; do [[ -r $f ]] && { tail -n 50000 "$f" | grep -i 'kernel' >"$KLOG"; break; }; done; fi
+  if (( HAS_JOURNAL )); then journalctl -p err --since "$SINCE" --no-pager -q -o short-iso >"$ERRLOG" 2>/dev/null; fi   # all errors
+  if [[ ! -s $ERRLOG && -n $SYSLOG ]]; then tail -n 100000 "$SYSLOG" | grep -Ei 'error|fail|crit|emerg|alert|panic|denied' >"$ERRLOG"; fi
+  if (( HAS_JOURNAL )); then journalctl --since "$SINCE" --no-pager -q -o short-iso _COMM=sshd _COMM=sudo _COMM=su _COMM=login >"$AUTHL" 2>/dev/null; fi   # logins
+  if [[ ! -s $AUTHL && -n $AUTHLOG ]]; then tail -n 100000 "$AUTHLOG" >"$AUTHL"; fi
+  touch "$KLOG" "$ERRLOG" "$AUTHL"                 # make sure the files exist
+}
+
+# ============================================================================
+#  1. SYSTEM OVERVIEW
+# ============================================================================
+check_overview() {
+  step "System overview"
+  local up_s boot_t ip kern cpu_model mem_kb users ct
+  up_s=$(awk '{print int($1)}' /proc/uptime)                                   # uptime seconds
+  UP_H=$(uptime -p 2>/dev/null | sed 's/^up //'); [[ -z $UP_H ]] && UP_H=$(dur_h "$up_s")
+  boot_t=$(uptime -s 2>/dev/null || echo "?")                                   # boot time
+  VIRT=$(systemd-detect-virt 2>/dev/null || echo "unknown"); [[ $VIRT == none ]] && VIRT="physical"   # VM or metal
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')                              # main IP
+  [[ -z $ip ]] && ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4; exit}')
+  kern=$(uname -r)
+  cpu_model=$(awk -F: '/model name/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo)
+  mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  users=$(who 2>/dev/null | wc -l)
+  ct=$(num "$(rd /sys/class/dmi/id/chassis_type)")                              # chassis type from firmware
+  case $ct in 8|9|10|11|14|30|31|32) IS_LAPTOP=1 ;; esac                         # portable / laptop / notebook / tablet / convertible
+  compgen -G "/sys/class/power_supply/BAT*" >/dev/null && IS_LAPTOP=1          # has a battery = laptop
+  local mtype="server / desktop"; (( IS_LAPTOP )) && mtype="laptop"; [[ $VIRT != physical && $VIRT != unknown ]] && mtype="virtual machine ($VIRT)"
+  local model; model="$(rd /sys/class/dmi/id/sys_vendor) $(rd /sys/class/dmi/id/product_name)"; model=${model# }
+
+  local w=70 line ic lb vl                                                      # host card
+  printf '%s%s%s%s%s\n' "$PFX" "$BLU" "$BX_TL" "$(rep "$BX_H" "$w")" "$R"
+  for line in "$I_HOST|Host|$HOST" "$I_OS|OS|$OS_NAME" "$I_KER|Kernel|$kern ($(uname -m))" \
+              "$I_VM|Machine|$mtype  ${model:0:34}" "$I_CPU|CPU|$(nproc 2>/dev/null) threads  ${cpu_model:0:40}" \
+              "$I_MEM|RAM|$(human_kb "$mem_kb")" "$I_UP|Uptime|$UP_H (since $boot_t)" "$I_NET|IP|${ip:-none}  ($users login sessions)"; do
+    IFS='|' read -r ic lb vl <<<"$line"
+    printf '%s%s%s%s %s %s%-9s%s %s\n' "$PFX" "$BLU" "$BX_V" "$R" "$ic" "$CYN$B" "$lb" "$R" "${vl:0:58}"
+  done
+  printf '%s%s%s%s%s\n' "$PFX" "$BLU" "$BX_BL" "$(rep "$BX_H" "$w")" "$R"
+
+  if (( up_s > 180*86400 )); then
+    add_finding WARN "Not rebooted for $((up_s/86400)) days - security fixes for the kernel installed since then are NOT active" "Plan a maintenance reboot" "uptime: $UP_H, booted $boot_t"
+  else good "Uptime looks normal ($UP_H)"; fi
+  if has_cmd last; then
+    local lr; lr=$(last -x -n 6 reboot shutdown 2>/dev/null | grep -Ev '^$|wtmp begins' | head -6)
+    [[ -n $lr ]] && { sub "Recent reboots & shutdowns"; printf '%s\n' "$lr" | table_rows; }
+  fi
+}
+
+# ============================================================================
+#  2. CPU
+# ============================================================================
+VM_R=0; VM_B=0; VM_SI=0; VM_SO=0; VM_US=0; VM_SY=0; VM_ID=100; VM_WA=0; VM_ST=0   # vmstat results (reused later)
+check_cpu() {
+  step "CPU"
+  local cores l1 l5 l15 lp
+  cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+  read -r l1 l5 l15 _ </proc/loadavg                                            # load averages
+  lp=$(awk -v l="$l1" -v c="$cores" 'BEGIN{printf "%d", l*100/c}')              # load as % of capacity
+  if has_cmd vmstat; then
+    run_spin "Sampling CPU, memory & disk activity for 5 seconds..." vmstat 1 5
+    read -r VM_R VM_B VM_SI VM_SO VM_US VM_SY VM_ID VM_WA VM_ST < <(awk '
+      NR==2 { for (i=1;i<=NF;i++) h[$i]=i }
+      END   { print $h["r"], $h["b"], $h["si"], $h["so"], $h["us"], $h["sy"], $h["id"], $h["wa"], (("st" in h) ? $h["st"] : 0) }' <<<"$SPIN_OUT")
+  fi
+  VM_R=$(num "$VM_R"); VM_B=$(num "$VM_B"); VM_SI=$(num "$VM_SI"); VM_SO=$(num "$VM_SO")
+  VM_US=$(num "$VM_US"); VM_SY=$(num "$VM_SY"); VM_ID=$(num "$VM_ID"); VM_WA=$(num "$VM_WA"); VM_ST=$(num "$VM_ST")
+
+  meter "CPU busy"  $((100 - VM_ID)) "user ${VM_US}%  system ${VM_SY}%"
+  meter "Load (1m)" "$lp"            "load $l1 / $l5 / $l15 on $cores threads"
+  meter "IO wait"   "$VM_WA"         "CPU idle, waiting for the disk"
+  (( VM_ST > 0 )) && meter "Steal" "$VM_ST" "CPU taken away by the hypervisor"
+  local gov cur max
+  gov=$(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)              # CPU frequency policy
+  cur=$(num "$(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)"); max=$(num "$(rd /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq)")
+  (( max > 0 )) && meter "CPU clock" $(( cur * 100 / max )) "$((cur/1000)) of $((max/1000)) MHz, governor: ${gov:-?}" 1
+
+  local tp tpid tpcpu tpcomm tpuser
+  read -r tpid tpuser tpcpu tpcomm < <(ps -eo pid,user,%cpu,comm --sort=-%cpu --no-headers 2>/dev/null | head -1)   # biggest CPU user
+  if awk -v l="$l5" -v c="$cores" 'BEGIN{exit !(l > c*2)}'; then
+    add_finding CRIT "System is overloaded: 5-min load $l5 is more than double the $cores CPU threads" "Limit or stop the runaway process shown below" \
+      "Top CPU user: $tpcomm (PID $tpid, user $tpuser) at ${tpcpu}% CPU"; FZ[cpu]=$((FZ[cpu]+2)); tp=1
+  elif awk -v l="$l5" -v c="$cores" 'BEGIN{exit !(l > c)}'; then
+    add_finding WARN "CPU is busier than it can handle (load $l5 on $cores threads) - everything feels slow" "Check the top processes below" \
+      "Top CPU user: $tpcomm (PID $tpid, user $tpuser) at ${tpcpu}% CPU"; FZ[cpu]=$((FZ[cpu]+1)); tp=1
+  else good "CPU load is healthy ($l1 on $cores threads)"; tp=0; fi
+  if (( tp )) && [[ -n ${tpid:-} ]] && awk -v c="${tpcpu:-0}" 'BEGIN{exit !(c >= 50)}' && [[ $tpcomm != kworker* && $tpcomm != ksoftirqd* ]]; then
+    add_fix "Lower the priority of '$tpcomm' (PID $tpid) so other programs get CPU first (renice +10)" "renice -n 10 -p $tpid" "(( \$(ps -o ni= -p $tpid) >= 10 ))" care
+  fi
+  if (( VM_WA >= 20 )); then
+    add_finding WARN "CPUs spend ${VM_WA}% of their time waiting for the disk - storage is the bottleneck" "See section 11; find the IO hog: iotop -o" "vmstat wa=${VM_WA}% b=${VM_B} (processes blocked on IO)"; FZ[io]=$((FZ[io]+2))
+  fi
+  if (( VM_ST >= 10 )); then
+    add_finding WARN "Hypervisor steals ${VM_ST}% CPU - the VM host is overcommitted" "Ask the virtualization admin to move or resize this VM" "vmstat st=${VM_ST}%"; FZ[cpu]=$((FZ[cpu]+1))
+  fi
+  sub "Top 5 CPU users"
+  table_head "$(printf '%-8s %-12s %6s %6s  %s' PID USER CPU% MEM% COMMAND)"
+  ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu --no-headers 2>/dev/null | head -5 | awk '{printf "%-8s %-12.12s %6s %6s  %s\n",$1,$2,$3,$4,$5}' | table_rows
+  local thr; thr=$(cnt 'cpu clock throttled|temperature above threshold|thermal.*critical' "$KLOG")
+  (( thr > 0 )) && { add_finding WARN "CPU was slowed down for heat $thr time(s) (thermal throttling)" "Check fans & cooling (section 6)" "$(grep -Ei 'throttled|above threshold' "$KLOG" | tail -2)"; FZ[hw]=$((FZ[hw]+1)); }
+  return 0
+}
+
+# ============================================================================
+#  3. MEMORY
+# ============================================================================
+OOM_N=0
+check_memory() {
+  step "Memory"
+  local mt ma sf st mu su
+  mt=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); ma=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+  [[ -z $ma ]] && ma=$(awk '/^(MemFree|Buffers|Cached):/{s+=$2} END{print s}' /proc/meminfo)   # old kernels
+  st=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo); sf=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+  mt=$(num "$mt"); ma=$(num "$ma"); st=$(num "$st"); sf=$(num "$sf"); (( mt > 0 )) || mt=1
+  mu=$(( (mt - ma) * 100 / mt ))
+  meter "RAM used" "$mu" "$(human_kb $((mt-ma))) of $(human_kb "$mt")"
+  if (( st > 0 )); then su=$(( (st - sf) * 100 / st )); meter "Swap used" "$su" "$(human_kb $((st-sf))) of $(human_kb "$st")"
+  else su=0; info "No swap configured"; fi
+  local hog; hog=$(ps -eo pid,rss,comm --sort=-rss --no-headers 2>/dev/null | head -3 | while read -r p r c; do echo "$c (PID $p) uses $(human_kb "$r")"; done)   # biggest memory users
+
+  if   (( mu >= 95 )); then add_finding CRIT "RAM is almost full (${mu}%) - the system will crawl or start killing programs" "Restart / limit the memory hog, or add RAM/swap" "$hog"; FZ[mem]=$((FZ[mem]+2))
+  elif (( mu >= 85 )); then add_finding WARN "RAM usage is high (${mu}%)" "Check the top memory users below" "$hog"; FZ[mem]=$((FZ[mem]+1))
+  else good "RAM usage is fine (${mu}%)"; fi
+  if   (( su >= 80 )); then add_finding CRIT "Swap is ${su}% full - RAM ran out and the disk is used as memory (very slow)" "Free memory or add RAM" "$hog"; FZ[mem]=$((FZ[mem]+2))
+  elif (( su >= 50 )); then add_finding WARN "Swap is ${su}% used - memory has been under pressure" "Check the top memory users below" "$hog"; FZ[mem]=$((FZ[mem]+1)); fi
+  if (( st == 0 && mu >= 80 )); then
+    add_finding WARN "No swap and high RAM use - one spike will trigger the out-of-memory killer" "Add a 2 GB swap file" "SwapTotal: 0"
+    add_fix "Create and enable a 2 GB swap file at /swapfile (fstab backed up first)" "make_swapfile 2" "swapon --show 2>/dev/null | grep -q /swapfile" care
+  fi
+  sub "Top 5 memory users"
+  table_head "$(printf '%-8s %-12s %6s %10s  %s' PID USER MEM% RSS COMMAND)"
+  ps -eo pid,user,%mem,rss,comm --sort=-rss --no-headers 2>/dev/null | head -5 | \
+    while read -r p u m r c; do printf '%-8s %-12.12s %6s %10s  %s\n' "$p" "$u" "$m" "$(human_kb "$r")" "$c"; done | table_rows
+  OOM_N=$(cnt 'out of memory|oom-kill|killed process' "$KLOG")
+  if (( OOM_N > 0 )); then
+    local vic; vic=$(grep -Eio 'killed process [0-9]+ \([^)]+\)' "$KLOG" | sed -E 's/.*\((.*)\)/\1/' | sort | uniq -c | sort -rn | head -5 | awk '{printf "%s killed %d time(s)\n",$2,$1}')
+    add_finding CRIT "The out-of-memory killer fired $OOM_N time(s): RAM ran out and programs were killed" "Give the victim app a memory limit, fix its leak, or add RAM" "$vic"; FZ[mem]=$((FZ[mem]+3))
+  else good "No out-of-memory kills in the last $HOURS h"; fi
+}
+
+make_swapfile() {                                  # fix helper: create /swapfile of N GB (only called from the fix menu)
+  local gb=${1:-2} fst free
+  [[ -e /swapfile ]] && { echo "/swapfile already exists - not touching it"; return 1; }
+  fst=$(findmnt -no FSTYPE / 2>/dev/null); [[ $fst == btrfs ]] && { echo "Root is btrfs - swap files need special setup there; skipped"; return 1; }
+  free=$(df -Pk / | awk 'NR==2{print $4}'); (( free > (gb + 3) * 1048576 )) || { echo "Not enough free space on /"; return 1; }
+  fallocate -l "${gb}G" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((gb * 1024)) status=none
+  chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile || return 1
+  bk /etc/fstab                                    # back up fstab before changing it
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >>/etc/fstab   # make it permanent
+  swapon --show
+}
+
+# ============================================================================
+#  4. DISK & FILESYSTEMS
+# ============================================================================
+check_disk() {
+  step "Disk & filesystems"
+  local fs type size used avail pct mnt p bad=0 big
+  local XF=(-x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x iso9660 -x fuse.snapfuse)   # ignore pseudo filesystems
+  sub "Space usage"
+  while read -r fs type size used avail pct mnt; do
+    p=$(num "${pct%\%}")
+    meter "${mnt}" "$p" "$(human_kb "$used") used of $(human_kb "$size"), $(human_kb "$avail") free ($type)"
+    if (( p >= 85 )); then
+      big=""
+      if (( ! QUICK )); then run_spin "Finding what fills $mnt..." to 25 du -xh --max-depth=1 "$mnt"; big=$(sort -rh <<<"$SPIN_OUT" | sed -n '2,6p'); fi
+      if (( p >= 95 )); then add_finding CRIT "Filesystem $mnt is ${p}% full - programs will fail to write" "du -xh --max-depth=1 $mnt | sort -h | tail -15  (remove/move what you don't need)" "${big:-$fs $pct used}"
+      else add_finding WARN "Filesystem $mnt is ${p}% full" "du -xh --max-depth=1 $mnt | sort -h | tail -15" "${big:-$fs $pct used}"; fi
+      bad=1
+      if [[ $mnt == / || $mnt == /var || $mnt == /var/log ]]; then          # safe space savers on system filesystems
+        (( HAS_JOURNAL )) && add_fix "Shrink the systemd journal to 200 MB" "journalctl --vacuum-size=200M" "" safe
+        case $PKG in
+          apt-get) add_fix "Clean the apt package cache" "apt-get clean" "" safe ;;
+          dnf|yum) add_fix "Clean the $PKG package cache" "$PKG clean all" "" safe ;;
+        esac
+      fi
+    fi
+  done < <(to 15 df -PT "${XF[@]}" 2>/dev/null | tail -n +2 | \
+           awk '{for(i=NF;i>0;i--) if ($i ~ /^[0-9]+%$/) break; if (i<5) next
+                 m=$(i+1); for(j=i+2;j<=NF;j++) m=m" "$j
+                 print $1, (i>=6 ? $2 : "?"), $(i-3), $(i-2), $(i-1), $i, m}')   # columns found via the "NN%" field, any df layout works
+  (( bad )) || good "All filesystems have enough free space"
+
+  bad=0
+  while read -r fs ino iu ifr ipct mnt; do                                     # inode (file-count) usage
+    [[ $ipct == "-" ]] && continue
+    p=$(num "${ipct%\%}")
+    if (( p >= 90 )); then add_finding CRIT "Filesystem $mnt used ${p}% of its inodes - no new files can be created even with free space" \
+      "Find folders with millions of small files (sessions, mail queues, caches)" "$fs: $iu of $ino inodes used"; bad=1; fi
+  done < <(to 15 df -Pi "${XF[@]}" 2>/dev/null | tail -n +2)
+  (( bad )) || good "Inode (file count) usage is fine"
+
+  local ro; ro=$(awk '$4 ~ /(^|,)ro(,|$)/ && $3 ~ /^(ext[234]|xfs|btrfs|jfs|reiserfs)$/ {print $2" ("$1")"}' /proc/mounts)
+  if [[ -n $ro ]]; then
+    add_finding CRIT "Filesystem(s) mounted READ-ONLY - usually the kernel did this after disk errors" "Check section 5; repair with fsck from rescue mode, then reboot" "$ro"; FZ[io]=$((FZ[io]+2))
+  else good "No filesystem is stuck in read-only mode"; fi
+
+  if (( HAS_JOURNAL )); then
+    local ju jb
+    ju=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]'); [[ -n $ju ]] && info "Systemd journal uses $ju on disk"
+    jb=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+G' | cut -d. -f1)
+    if (( $(num "$jb") >= 2 )); then
+      add_finding WARN "The systemd journal takes $ju of disk" "journalctl --vacuum-size=200M" "journalctl --disk-usage: $ju"
+      add_fix "Shrink the systemd journal to 200 MB" "journalctl --vacuum-size=200M" "" safe
+    fi
+  fi
+  if (( IS_ROOT )) && (( ! QUICK )); then sub "Biggest items in /var/log"; to 20 du -sh /var/log/* 2>/dev/null | sort -rh | head -5 | table_rows; fi
+}
+
+# ============================================================================
+#  5. STORAGE HARDWARE
+# ============================================================================
+check_hardware() {
+  step "Storage hardware"
+  local d out ev
+  if (( QUICK )); then skip "SMART disk health (quick mode)"
+  elif ! has_cmd smartctl; then skip "SMART disk health - install 'smartmontools' to enable"
+  elif (( ! IS_ROOT )); then skip "SMART disk health needs root"
+  else
+    for d in $(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
+      run_spin "Reading SMART health of /dev/$d..." to 40 smartctl -H -A "/dev/$d"
+      out=$SPIN_OUT
+      local realloc pend used poh
+      realloc=$(awk '/Reallocated_Sector_Ct/{print $NF; exit}' <<<"$out"); pend=$(awk '/Current_Pending_Sector/{print $NF; exit}' <<<"$out")
+      used=$(awk -F: '/Percentage Used/{gsub(/[ %]/,"",$2); print $2; exit}' <<<"$out")   # NVMe wear
+      poh=$(awk '/Power_On_Hours/{print $NF; exit} /Power On Hours/{gsub(/[^0-9]/,"",$2); print $2; exit}' FS=: <<<"$out")
+      ev="realloc=${realloc:-n/a} pending=${pend:-n/a} wear=${used:-n/a}% power-on-hours=${poh:-n/a}"
+      if grep -q 'FAILED' <<<"$out"; then
+        add_finding CRIT "Disk /dev/$d says it is FAILING (SMART) - back up NOW and replace it" "smartctl -a /dev/$d" "$ev"; FZ[io]=$((FZ[io]+3)); FZ[hw]=$((FZ[hw]+2))
+      elif grep -Eq 'PASSED|: OK' <<<"$out"; then
+        if (( $(num "$pend") > 0 )); then add_finding CRIT "Disk /dev/$d has $pend unreadable (pending) sectors - it is starting to fail" "Back up and plan replacement" "$ev"; FZ[io]=$((FZ[io]+2))
+        elif (( $(num "$realloc") > 0 )); then add_finding WARN "Disk /dev/$d has remapped $realloc bad sectors" "Watch it: smartctl -A /dev/$d; replace if the number grows" "$ev"
+        else good "Disk /dev/$d SMART health: PASSED"; fi
+        [[ -n $used ]] && meter "/dev/$d wear" "$(num "$used")" "SSD life used"
+        (( $(num "$used") >= 90 )) && add_finding WARN "SSD /dev/$d has used ${used}% of its rated life" "Plan a replacement" "$ev"
+      else note "/dev/$d: SMART not available (virtual disk or unsupported controller)"; fi
+    done
+  fi
+  if [[ -r /proc/mdstat ]] && grep -q '^md' /proc/mdstat; then
+    if grep -Eq '\[[U_]*_[U_]*\]' /proc/mdstat; then add_finding CRIT "Software RAID is DEGRADED - a disk dropped out of the array" "mdadm --detail /dev/mdX ; replace and re-add the disk" "$(grep -A1 '^md' /proc/mdstat | head -4)"; FZ[hw]=$((FZ[hw]+1))
+    elif grep -Eq 'recovery|resync' /proc/mdstat; then info "Software RAID is rebuilding (expect slow disks until done)"
+    else good "Software RAID arrays are healthy"; fi
+  fi
+  local rx='I/O error|Buffer I/O|blk_update_request|EXT4-fs error|XFS .*(error|corrupt)|BTRFS error|ata[0-9.]+: .*(failed|error)|critical (medium|target) error|reset controller|nvme.*timeout'
+  local derr; derr=$(cnt "$rx" "$KLOG")
+  if (( derr > 0 )); then
+    add_finding CRIT "Kernel logged $derr disk / filesystem error(s) - storage hardware or filesystem is in trouble" "Check cables/controller, SMART, then fsck the filesystem" "$(grep -Ei "$rx" "$KLOG" | tail -4 | cut -c1-150)"; FZ[io]=$((FZ[io]+3))
+  else good "No disk or filesystem errors in the kernel log"; fi
+  local mce; mce=$(cnt 'Machine check|mce:|Hardware Error|EDAC .*(CE|UE)|PCIe Bus Error' "$KLOG")
+  if (( mce > 0 )); then
+    add_finding CRIT "$mce hardware error(s) from CPU/RAM/PCIe (MCE/EDAC) - faulty RAM or board likely" "Run memtest86+, check vendor hardware logs (iLO/iDRAC/IPMI)" "$(grep -Ei 'Machine check|mce:|Hardware Error|EDAC|PCIe Bus Error' "$KLOG" | tail -3 | cut -c1-150)"; FZ[hw]=$((FZ[hw]+3))
+  else good "No CPU / RAM / PCIe hardware errors reported"; fi
+}
+
+# ============================================================================
+#  6. COOLING, FANS & BATTERY
+# ============================================================================
+check_cooling() {
+  step "Cooling, fans & battery"
+  if [[ $VIRT != physical && $VIRT != unknown ]]; then skip "virtual machine ($VIRT) - no physical fans, sensors or battery"; return 0; fi
+  local h hn t v lb cr maxt=0 n=0 sens=()
+  for h in /sys/class/hwmon/hwmon*; do              # every hardware monitor chip
+    [[ -d $h ]] || continue
+    hn=$(rd "$h/name"); hn=${hn:-hwmon}
+    for t in "$h"/temp*_input; do
+      [[ -r $t ]] || continue
+      v=$(num "$(rd "$t")"); v=$((v / 1000)); (( v <= 0 || v > 150 )) && continue   # millidegrees -> degrees, skip junk
+      lb=$(rd "${t%_input}_label"); lb="${hn}${lb:+: $lb}"
+      cr=$(num "$(rd "${t%_input}_crit")"); cr=$((cr / 1000)); (( cr < 50 || cr > 150 )) && cr=100   # critical limit or 100 C
+      sens+=("$v|$cr|$lb"); (( v > maxt )) && maxt=$v
+    done
+  done
+  if (( ${#sens[@]} == 0 )); then                  # fallback: ACPI thermal zones
+    for t in /sys/class/thermal/thermal_zone*/temp; do
+      [[ -r $t ]] || continue
+      v=$(( $(num "$(rd "$t")") / 1000 )); (( v <= 0 || v > 150 )) && continue
+      sens+=("$v|100|$(rd "${t%/temp}/type")"); (( v > maxt )) && maxt=$v
+    done
+  fi
+  if (( ${#sens[@]} > 0 )); then
+    sub "${I_TMP}Temperatures (hottest first)"
+    while IFS='|' read -r v cr lb; do                # show up to 10 sensors, hottest first
+      n=$((n+1)); (( n > 10 )) && break
+      meter "${lb:0:18}" $(( v * 100 / cr )) "${v} C  (critical at ${cr} C)"
+      TEMP_L+=("$lb"); TEMP_C+=("$v"); TEMP_X+=("$cr")
+      if (( v >= cr - 5 )); then add_finding CRIT "$lb is at ${v} C - right at its critical limit (${cr} C). The machine will throttle or shut down" "Check fans, airflow, dust, heatsink paste" "$lb ${v} C / crit ${cr} C"; FZ[hw]=$((FZ[hw]+2))
+      elif (( v >= 85 )); then add_finding WARN "$lb runs hot at ${v} C" "Clean dust, check fan, improve airflow" "$lb ${v} C"; FZ[hw]=$((FZ[hw]+1)); fi
+    done < <(printf '%s\n' "${sens[@]}" | sort -t'|' -k1,1 -rn)
+    (( maxt < 85 )) && good "Temperatures are fine (hottest ${maxt} C)"
+  else skip "no temperature sensors exposed"; fi
+
+  sub "${I_FAN} Fans"
+  local f rpm mn fl found=0
+  for f in /sys/class/hwmon/hwmon*/fan*_input; do  # every fan the firmware reports
+    [[ -r $f ]] || continue
+    found=1; rpm=$(num "$(rd "$f")"); mn=$(num "$(rd "${f%_input}_min")")
+    fl=$(rd "${f%_input}_label"); [[ -z $fl ]] && fl="$(rd "$(dirname "$f")/name") $(basename "${f%_input}")"
+    FAN_L+=("$fl"); FAN_R+=("$rpm")
+    printf '%s%s %-24.24s %s%6d RPM%s  %s\n' "$PFX" "$I_FAN" "$fl" "$CYN$B" "$rpm" "$R" "$(grad_bar $(( rpm > 6000 ? 100 : rpm * 100 / 6000 )) 20 1)"
+    if (( rpm == 0 && maxt >= 70 )); then
+      add_finding CRIT "Fan '$fl' is STOPPED (0 RPM) while the machine is at ${maxt} C - the fan is dead, blocked or unplugged" "Clean / replace the fan; check BIOS fan settings" "$fl: 0 RPM, hottest sensor ${maxt} C"; FZ[hw]=$((FZ[hw]+3))
+    elif (( rpm == 0 )); then note "'$fl' is idle (0 RPM) - normal when the machine is cool (${maxt} C)"
+    elif (( mn > 0 && rpm < mn )); then add_finding WARN "Fan '$fl' spins below its minimum ($rpm < $mn RPM) - worn bearing or dust" "Clean or replace the fan" "$fl: $rpm RPM, minimum $mn"
+    else good "Fan '$fl' is spinning ($rpm RPM)"; fi
+  done
+  if [[ -r /proc/acpi/ibm/fan ]]; then             # ThinkPad fan interface
+    found=1; rpm=$(num "$(awk '/^speed:/{print $2}' /proc/acpi/ibm/fan)")
+    FAN_L+=("ThinkPad fan"); FAN_R+=("$rpm")
+    printf '%s%s %-24.24s %s%6d RPM%s  level %s\n' "$PFX" "$I_FAN" "ThinkPad fan" "$CYN$B" "$rpm" "$R" "$(awk '/^level:/{print $2}' /proc/acpi/ibm/fan)"
+    (( rpm == 0 && maxt >= 70 )) && add_finding CRIT "ThinkPad fan is STOPPED at ${maxt} C" "Clean / replace the fan" "ThinkPad fan 0 RPM"
+  fi
+  if (( ! found )); then
+    if has_cmd sensors && sensors 2>/dev/null | grep -qi 'fan'; then
+      sensors 2>/dev/null | grep -i 'fan' | table_rows; found=1
+    elif (( IS_LAPTOP )) || [[ $VIRT == physical ]]; then
+      add_finding INFO "Fan speed is not visible - the fan driver/sensors are not loaded" "Install lm-sensors and run: sensors-detect --auto" "no fan*_input in /sys/class/hwmon"
+      case $PKG in
+        apt-get) add_fix "Install lm-sensors and detect the fan/temperature chips" "DEBIAN_FRONTEND=noninteractive apt-get install -y lm-sensors && sensors-detect --auto" "command -v sensors" care ;;
+        dnf|yum) add_fix "Install lm_sensors and detect the fan/temperature chips" "$PKG install -y lm_sensors && sensors-detect --auto" "command -v sensors" care ;;
+      esac
+    else
+      skip "no fan sensors exposed on this machine"
+    fi
+  fi
+
+  local b st cap ef ed cyc hl ac=0 a
+  for a in /sys/class/power_supply/{AC,AC0,ACAD,ADP0,ADP1}/online; do [[ $(rd "$a") == 1 ]] && ac=1; done   # charger plugged in?
+  for b in /sys/class/power_supply/BAT*; do        # every battery
+    [[ -d $b ]] || continue
+    sub "${I_BAT} Battery $(basename "$b")"
+    st=$(rd "$b/status"); cap=$(num "$(rd "$b/capacity")")
+    ef=$(num "$(rd "$b/energy_full")"); ed=$(num "$(rd "$b/energy_full_design")")
+    (( ef == 0 )) && { ef=$(num "$(rd "$b/charge_full")"); ed=$(num "$(rd "$b/charge_full_design")"); }
+    cyc=$(num "$(rd "$b/cycle_count")")
+    hl=0; (( ed > 0 )) && hl=$(( ef * 100 / ed )); (( hl > 100 )) && hl=100   # health = capacity now vs when new
+    meter "Charge" "$cap" "${st:-?}, charger $( ((ac)) && echo connected || echo 'not connected')" 1
+    (( hl > 0 )) && meter "Battery health" "$hl" "holds ${hl}% of its design capacity, ${cyc} charge cycles" 1
+    BAT_JSON=$(printf '{"name":"%s","status":"%s","cap":%d,"health":%d,"cycles":%d,"ac":%s}' "$(basename "$b")" "${st:-?}" "$cap" "$hl" "$cyc" "$( ((ac)) && echo true || echo false)")
+    if (( hl > 0 && hl < 50 )); then add_finding WARN "Battery is worn out: it holds only ${hl}% of its original capacity" "Replace the battery" "$(basename "$b"): health ${hl}%, ${cyc} cycles"
+    elif (( hl > 0 && hl < 75 )); then add_finding INFO "Battery has aged: ${hl}% of its original capacity left" "Expect shorter battery life; replace when it bothers you" "$(basename "$b"): ${cyc} cycles"
+    elif (( hl > 0 )); then good "Battery health is good (${hl}%)"; fi
+    (( cap <= 10 && ac == 0 )) && add_finding WARN "Battery is almost empty (${cap}%) and the charger is not connected" "Plug in the charger" ""
+  done
+  return 0
+}
+
+# ============================================================================
+#  7. PROCESSES & ZOMBIES
+# ============================================================================
+zcount_of() { ps -eo ppid=,stat= 2>/dev/null | awk -v p="$1" '$1==p && $2 ~ /^Z/' | wc -l; }   # zombies of a parent (used by fix verification)
+proc_unit() {                                      # systemd unit that owns a PID
+  local u; u=$(ps -o unit= -p "$1" 2>/dev/null | tr -d ' ')
+  [[ -z $u || $u == "-" ]] && u=$(grep -oE '[^/]+\.(service|scope)' "/proc/$1/cgroup" 2>/dev/null | tail -1)
+  echo "${u:--}"
+}
+proc_pkg() {                                       # package that installed the program behind a PID
+  local exe p=""; exe=$(readlink -f "/proc/$1/exe" 2>/dev/null)
+  [[ -z $exe ]] && { echo "-"; return; }
+  if has_cmd dpkg && p=$(dpkg -S "$exe" 2>/dev/null || dpkg -S "${exe#/usr}" 2>/dev/null); then p=${p%%:*}
+  elif has_cmd rpm && p=$(rpm -qf --qf '%{NAME}\n' "$exe" 2>/dev/null); then :
+  else p="-"; fi
+  echo "${p:--}"
+}
+check_processes() {
+  step "Processes & zombies"
+  local all tot run slp dst zst stp
+  all=$(ps -eo stat= 2>/dev/null)
+  tot=$(grep -c . <<<"$all"); run=$(grep -c '^R' <<<"$all"); slp=$(grep -c '^[SI]' <<<"$all")
+  dst=$(grep -c '^D' <<<"$all"); zst=$(grep -c '^Z' <<<"$all"); stp=$(grep -c '^[Tt]' <<<"$all")
+  kv "Processes" "$tot total: $run running, $slp sleeping, $dst waiting on IO, $stp stopped, $zst zombie"
+  if (( zst == 0 )); then good "No zombie processes"; return 0; fi
+
+  local zl pp; zl=$(ps -eo pid=,ppid=,stat=,etimes=,comm= 2>/dev/null | awk '$3 ~ /^Z/')   # all zombies: pid ppid stat age name
+  sub "Zombies grouped by the parent application that should clean them up"
+  table_head "$(printf '%-8s %-18s %-26s %7s %9s  %s' PARENT APPLICATION SERVICE ZOMBIES OLDEST PACKAGE)"
+  for pp in $(awk '{print $2}' <<<"$zl" | sort | uniq -c | sort -rn | awk '{print $2}'); do   # parents, most zombies first
+    local zc oldest app pcmd unit pkg kids puser sev hint ev
+    zc=$(awk -v p="$pp" '$2==p' <<<"$zl" | wc -l)
+    oldest=$(awk -v p="$pp" '$2==p{if($4+0>m)m=$4+0} END{print m+0}' <<<"$zl")
+    kids=$(awk -v p="$pp" '$2==p{printf "%s(%s) ", $5, $1}' <<<"$zl" | cut -c1-150)
+    app=$(ps -o comm= -p "$pp" 2>/dev/null); app=${app:-unknown}
+    puser=$(ps -o user= -p "$pp" 2>/dev/null | tr -d ' ')
+    pcmd=$(tr '\0' ' ' <"/proc/$pp/cmdline" 2>/dev/null | cut -c1-120)
+    unit=$(proc_unit "$pp"); pkg=$(proc_pkg "$pp")
+    printf '%-8s %-18.18s %-26.26s %7d %9s  %s\n' "$pp" "$app" "$unit" "$zc" "$(dur_h "$oldest")" "$pkg" | table_rows
+    ZB_PP+=("$pp"); ZB_APP+=("$app"); ZB_CMD+=("$pcmd"); ZB_UNIT+=("$unit"); ZB_CNT+=("$zc"); ZB_OLD+=("$(dur_h "$oldest")"); ZB_PKG+=("$pkg"); ZB_USER+=("${puser:-?}")
+    if (( oldest < 30 && zc < 5 )); then note "PID $pp ($app): $zc short-lived zombie(s) - normal, they are cleaned up within seconds"; continue; fi
+    sev=WARN; (( zc >= 100 )) && { sev=CRIT; FZ[limits]=$((FZ[limits]+1)); }
+    ev=$(printf 'Parent : %s (PID %s, user %s)\nCommand: %s\nService: %s   Package: %s\nZombies: %d, oldest %s: %s' "$app" "$pp" "${puser:-?}" "${pcmd:--}" "$unit" "$pkg" "$zc" "$(dur_h "$oldest")" "$kids")
+    if (( pp == 1 )); then hint="Zombies owned by PID 1 (init) can only be cleared by a reboot"
+    elif [[ $unit == *.service ]]; then hint="systemctl restart $unit   (the app '$app' has a bug: it does not wait() for its children - update it)"
+    else hint="kill -s CHLD $pp ; if they stay, restart or stop '$app' (kill $pp) - and update it"; fi
+    add_finding "$sev" "'$app' (PID $pp) is leaving $zc zombie process(es) behind - it does not clean up its finished child processes" "$hint" "$ev"
+    if (( pp != 1 )); then
+      add_fix "Nudge '$app' to clean up its zombies (send SIGCHLD to PID $pp)" "kill -s CHLD $pp" "(( \$(zcount_of $pp) == 0 ))" safe
+      if [[ $unit == *.service ]]; then
+        local rk=care; [[ $unit =~ ^(dbus|systemd-|display-manager|gdm|sddm|lightdm|sshd|ssh)\. ]] && rk=risky   # core services restart = risky
+        add_fix "Restart service $unit (the parent of the zombies)" "systemctl restart '$unit'" "(( \$(zcount_of $pp) == 0 ))" "$rk"
+      elif [[ ! $app =~ ^(systemd|init|sshd|login|dbus-daemon|Xorg|gnome-shell|kthreadd)$ ]]; then
+        add_fix "Stop parent '$app' (PID $pp) - init then removes the zombies" "kill $pp; sleep 3; kill -0 $pp 2>/dev/null && kill -9 $pp; true" "! kill -0 $pp 2>/dev/null" risky
+      fi
+    fi
+  done
+  return 0
+}
+
+# ============================================================================
+#  8. SERVICES & BOOT
+# ============================================================================
+check_services() {
+  step "Services & boot"
+  if (( ! HAS_SYSTEMD )); then skip "systemd not in use - service checks skipped"; return 0; fi
+  local failed u ev
+  failed=$(systemctl --failed --no-legend --plain --no-pager 2>/dev/null | \
+    awk '{for(i=1;i<=NF;i++) if ($i ~ /\.(service|socket|mount|timer|target|path|swap|automount)$/) {print $i; break}}')
+  if [[ -n $failed ]]; then
+    for u in $failed; do
+      ev=$(journalctl -u "$u" -n 4 --no-pager -q 2>/dev/null | cut -c1-150)  # why it failed
+      add_finding CRIT "Service '$u' has FAILED" "journalctl -u $u -n 50 --no-pager   (read why), then: systemctl restart $u" "$ev"
+      add_fix "Restart $u" "systemctl restart '$u'" "systemctl is-active -q '$u'" safe
+    done
+  else good "No failed services"; fi
+  local bt; bt=$(to 10 systemd-analyze 2>/dev/null | head -1)
+  if [[ -n $bt ]]; then
+    info "Boot: ${bt#Startup finished in }"
+    grep -Eq '= *([2-9]|[1-9][0-9])min' <<<"$bt" && add_finding WARN "Boot is slow (over 2 minutes)" "systemd-analyze blame | head  (fix or disable the slowest units)" "$(to 10 systemd-analyze blame --no-pager 2>/dev/null | head -3)"
+    sub "Slowest services at boot"; to 10 systemd-analyze blame --no-pager 2>/dev/null | head -5 | table_rows
+  fi
+  local pan seg
+  pan=$(cnt 'Kernel panic|kernel BUG|Oops:|general protection fault' "$KLOG")
+  (( pan > 0 )) && { add_finding CRIT "Kernel crash / bug messages found ($pan) - a driver or kernel problem" "Update the kernel and drivers" "$(grep -Ei 'Kernel panic|kernel BUG|Oops:|general protection' "$KLOG" | tail -3 | cut -c1-150)"; FZ[kernel]=$((FZ[kernel]+3)); }
+  seg=$(cnt 'segfault at|traps:.*(general protection|trap)' "$KLOG")
+  if (( seg > 0 )); then
+    add_finding WARN "Programs crashed (segfault) $seg time(s)" "Update or reinstall the program(s) listed" \
+      "$(grep -Eo '[A-Za-z0-9_.+-]+\[[0-9]+\]: segfault' "$KLOG" | sed -E 's/\[[0-9]+\].*//' | sort | uniq -c | sort -rn | head -4 | awk '{print $2" crashed "$1" time(s)"}')"
+  fi
+  (( pan == 0 && seg == 0 )) && good "No kernel crashes or program segfaults"
+  return 0
+}
+
+# ============================================================================
+#  9. LOG SCAN
+# ============================================================================
+PATTERNS=(                                         # regex @@ plain-English meaning
+  "out of memory|oom-kill|killed process@@RAM ran out - kernel killed programs"
+  "no space left on device@@A disk filled up - writes failed"
+  "read-only file system@@A filesystem went read-only (usually disk errors)"
+  "i/o error|buffer i/o|blk_update_request|medium error@@Disk / storage hardware errors"
+  "segfault|core dumped@@A program crashed"
+  "failed to start|failed with result|dependency failed@@A service could not start"
+  "connection refused@@Something tried to reach a service that is down"
+  "connection timed out|timed out|timeout@@Network or service too slow / unreachable"
+  "permission denied|operation not permitted@@Permission, SELinux or AppArmor block"
+  "authentication failure|failed password|invalid user@@Failed logins"
+  "temporary failure in name resolution|name or service not known|servfail|could not resolve@@DNS (name lookup) is broken"
+  "too many open files@@A program hit its open-files limit"
+  "network is unreachable|link is down|nic link is down@@Network link went down"
+  "certificate (verify failed|has expired)|ssl routines@@Certificate / TLS problem"
+  "call trace|kernel bug|soft lockup|hung_task|blocked for more than@@Kernel stalls or bugs"
+)
+check_logs() {
+  step "Log scan"
+  local total all="$EVID/all-problems.log"
+  cat "$ERRLOG" "$KLOG" >"$all" 2>/dev/null
+  total=$(wc -l <"$ERRLOG")
+  info "$total error-level log lines in the last $HOURS h  (source: $( ((HAS_JOURNAL)) && echo journal || echo "${SYSLOG:-none}"))"
+  if (( total > 1000 )); then add_finding WARN "Very noisy error log ($total errors in $HOURS h)" "Look at the top offenders below" "$(head -3 "$ERRLOG" | cut -c1-150)"
+  elif (( total > 0 )); then good "Error volume is moderate ($total lines)"
+  else good "No error-level log lines"; fi
+  sub "What the logs are saying (plain English)"
+  table_head "$(printf '%7s  %-6s %s' COUNT LEVEL MEANING)"
+  local p rx mean n hits=0
+  for p in "${PATTERNS[@]}"; do
+    rx=${p%%@@*}; mean=${p##*@@}
+    n=$(cnt "$rx" "$all")
+    if (( n > 0 )); then
+      hits=1
+      if (( n >= 50 )); then printf '%s%s%7d  %-6s%s %s\n' "$PFX" "$RED$B" "$n" "HIGH" "$R" "$mean"
+      else printf '%s%s%7d  %-6s%s %s\n' "$PFX" "$YEL" "$n" "low" "$R" "$mean"; fi
+    fi
+  done
+  (( hits )) || ok "None of the well-known problem patterns were found"
+  local dns perm fd
+  dns=$(cnt 'temporary failure in name resolution|name or service not known|could not resolve' "$all")
+  (( dns >= 5 )) && add_finding WARN "DNS lookups failed $dns times in the logs" "See section 10 (Network & DNS)" "$(grep -Ei 'name resolution|could not resolve' "$all" | tail -2 | cut -c1-150)"
+  fd=$(cnt 'too many open files' "$all")
+  (( fd > 0 )) && { add_finding WARN "A program hit 'too many open files' ($fd times)" "Raise LimitNOFILE= in its systemd unit (or ulimit -n)" "$(grep -i 'too many open files' "$all" | tail -2 | cut -c1-150)"; FZ[limits]=$((FZ[limits]+1)); }
+  perm=$(cnt 'permission denied' "$all")
+  (( perm >= 50 )) && add_finding WARN "Many 'permission denied' errors ($perm)" "Check file ownership and SELinux/AppArmor (section 12)" "$(grep -i 'permission denied' "$all" | tail -2 | cut -c1-150)"
+  if (( total > 0 )); then
+    sub "Programs producing the most errors"
+    table_head "$(printf '%7s  %s' COUNT PROGRAM)"
+    awk '{for(i=2;i<=6&&i<=NF;i++) if ($i ~ /:$/ && $i !~ /^[0-9:.T+-]+:$/) {p=$i; sub(/\[[0-9]+\]:$/,"",p); sub(/:$/,"",p); print p; break}}' "$ERRLOG" | \
+      sort | uniq -c | sort -rn | head -8 | awk '{printf "%7d  %s\n",$1,$2}' | table_rows
+    sub "Most repeated error messages"
+    table_head "$(printf '%7s  %s' COUNT MESSAGE)"
+    awk '{p=4; for(i=2;i<=6&&i<=NF;i++) if ($i ~ /:$/ && $i !~ /^[0-9:.T+-]+:$/) {p=i+1; break}
+          m=""; for(j=p;j<=NF;j++) m=m" "$j; gsub(/\[[0-9]+\]/,"",m); gsub(/0x[0-9a-fA-F]+/,"0x#",m); gsub(/[0-9]+/,"#",m); print substr(m,2,110)}' "$ERRLOG" | \
+      sort | uniq -c | sort -rn | head -10 | awk '{c=$1; $1=""; printf "%7d %s\n",c,$0}' | table_rows
+  fi
+  note "Full extracts saved in: $EVID"
+}
+
+# ============================================================================
+# 10. NETWORK & DNS
+# ============================================================================
+enable_firewall() {                                # fix helper: turn on the distro firewall without locking out SSH
+  if has_cmd firewall-cmd; then systemctl enable --now firewalld && firewall-cmd --permanent --add-service=ssh && firewall-cmd --reload
+  elif has_cmd ufw; then ufw allow 22/tcp && ufw --force enable
+  else echo "no firewall tool installed"; return 1; fi
+}
+fw_active() { { has_cmd firewall-cmd && [[ $(firewall-cmd --state 2>/dev/null) == running ]]; } || { has_cmd ufw && ufw status 2>/dev/null | grep -q 'Status: active'; }; }
+check_network() {
+  step "Network & DNS"
+  local gw=""
+  if has_cmd ip; then
+    sub "Interfaces"; ip -br addr 2>/dev/null | grep -v '^lo ' | table_rows
+    gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+    if [[ -z $gw ]]; then add_finding CRIT "No default gateway - this machine cannot reach other networks" "Fix the network config (netplan / nmcli / ifcfg)" "$(ip route 2>/dev/null | head -4)"
+    else
+      kv "Default gateway" "$gw"
+      if has_cmd ping; then
+        if to 6 ping -c 2 -W 2 "$gw" >/dev/null 2>&1; then good "Gateway $gw answers ping"
+        else add_finding WARN "Gateway $gw does not answer ping (blocked, or the link is broken)" "Check cable / VLAN / switch: ip -s link" "ping $gw: no reply"; fi
+      fi
+    fi
+    ip -4 -o addr show scope global 2>/dev/null | grep -q inet || add_finding CRIT "No interface has an IPv4 address" "Check DHCP or static IP config (nmcli / netplan)" "$(ip -br addr 2>/dev/null | head -4)"
+  fi
+  local inet=0
+  if has_cmd ping; then
+    if to 6 ping -c 2 -W 2 1.1.1.1 >/dev/null 2>&1 || to 6 ping -c 2 -W 2 8.8.8.8 >/dev/null 2>&1; then good "Internet is reachable (ping 1.1.1.1 / 8.8.8.8)"; inet=1
+    else add_finding WARN "Cannot ping the internet (1.1.1.1 / 8.8.8.8) - no route out or ICMP is blocked" "Check gateway, firewall, proxy" "ping 1.1.1.1 and 8.8.8.8: no reply"; fi
+  fi
+  local ns; ns=$(awk '/^nameserver/{printf "%s ",$2}' /etc/resolv.conf 2>/dev/null)
+  kv "DNS servers" "${ns:-none configured}"
+  if to 6 getent hosts debian.org >/dev/null 2>&1 || to 6 getent hosts redhat.com >/dev/null 2>&1; then good "DNS works (names resolve)"
+  else
+    if (( inet )); then add_finding CRIT "DNS is BROKEN - the internet works by IP address but names do not resolve" "Fix the nameservers (resolvectl / nmcli / /etc/resolv.conf)" "nameservers: ${ns:-none}; getent hosts debian.org failed"
+    else add_finding WARN "DNS lookups fail (probably because there is no internet access)" "Check /etc/resolv.conf" "nameservers: ${ns:-none}"; fi
+    systemctl is-active -q systemd-resolved 2>/dev/null && add_fix "Restart the DNS resolver (systemd-resolved)" "systemctl restart systemd-resolved" "getent hosts debian.org >/dev/null" safe
+  fi
+  if has_cmd ss; then
+    sub "Listening ports"
+    table_head "$(printf '%-6s %-28s %s' PROTO LOCAL-ADDRESS PROCESS)"
+    ss -tulpn 2>/dev/null | tail -n +2 | awk '{p=$NF; if (p !~ /users/) p="-"; gsub(/users:\(\("|",.*$/,"",p); printf "%-6s %-28s %s\n",$1,$5,p}' | sort -u | head -15 | table_rows
+  fi
+  local fw="none"
+  if fw_active; then fw="firewalld/ufw active"
+  elif has_cmd nft && (( $(nft list ruleset 2>/dev/null | grep -c 'chain') > 0 )); then fw="nftables rules loaded"
+  elif has_cmd iptables && (( $(iptables -S 2>/dev/null | grep -c '^-A') > 0 )); then fw="iptables rules loaded"; fi
+  if [[ $fw == none ]]; then
+    if (( ! IS_ROOT )); then skip "firewall status needs root"
+    else
+      add_finding WARN "No firewall is active - every listening port above is open to the network" "Enable firewalld (RedHat) or ufw (Debian), allowing SSH" "no firewalld/ufw/nftables/iptables rules"
+      { has_cmd firewall-cmd || has_cmd ufw; } && add_fix "Enable the firewall (SSH port 22 stays open)" "enable_firewall" "fw_active" risky
+    fi
+  else good "Firewall: $fw"; fi
+  if has_cmd timedatectl; then
+    local sync svc="" s; sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+    [[ -z $sync ]] && sync=$(timedatectl 2>/dev/null | awk -F: '/synchronized/{gsub(/ /,"",$2); print $2}')
+    if [[ $sync == yes ]]; then good "Clock is synchronized (NTP)"
+    else
+      for s in chronyd chrony systemd-timesyncd ntpd ntp; do systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "^$s" && { svc=$s; break; }; done
+      add_finding WARN "Clock is NOT synchronized - wrong time breaks logins (Kerberos/FreeIPA), TLS and log timelines" "systemctl restart ${svc:-chronyd}; chronyc tracking" "$(timedatectl 2>/dev/null | grep -Ei 'local time|synchronized|NTP service' | sed 's/^ *//')"
+      [[ -n $svc ]] && add_fix "Restart the time sync service ($svc)" "systemctl restart $svc" "systemctl is-active -q $svc" safe
+    fi
+  fi
+  local ct; ct=$(cnt 'nf_conntrack: table full|dropping packet' "$KLOG")
+  if (( ct > 0 )); then
+    local cmax; cmax=$(num "$(rd /proc/sys/net/netfilter/nf_conntrack_max)")
+    add_finding CRIT "Connection tracking table is full - network packets are being DROPPED ($ct times)" "Raise net.netfilter.nf_conntrack_max (and make it permanent in /etc/sysctl.d)" "nf_conntrack_max=$cmax"; FZ[limits]=$((FZ[limits]+2))
+    (( cmax > 0 )) && add_fix "Double the connection tracking table to $((cmax*2)) (until reboot)" "sysctl -w net.netfilter.nf_conntrack_max=$((cmax*2))" "(( \$(cat /proc/sys/net/netfilter/nf_conntrack_max) >= $((cmax*2)) ))" care
+  fi
+  return 0
+}
+
+# ============================================================================
+# 11. SYSTEM FREEZES & HANGS
+# ============================================================================
+psi() { awk '{for(i=2;i<=NF;i++){split($i,a,"="); if(a[1]=="avg60") v[$1]=a[2]}} END{printf "%d %d\n", v["some"]+0, v["full"]+0}' "$1" 2>/dev/null; }   # PSI file -> "some full"
+check_freeze() {
+  step "System freezes & hangs"
+  local n
+  n=$(cnt 'blocked for more than [0-9]+ seconds' "$KLOG")
+  if (( n > 0 )); then
+    add_finding CRIT "$n 'hung task' event(s): programs were frozen for 2+ minutes waiting inside the kernel (almost always disk or NFS)" "Check disk health (section 5), iostat -x, NFS mounts" \
+      "$(grep -Eo 'task [^ ]+ blocked for more than [0-9]+ seconds' "$KLOG" | sed -E 's/:[0-9]+ blocked/ blocked/' | sort | uniq -c | sort -rn | head -4)"; FZ[io]=$((FZ[io]+3))
+  else good "No hung-task (frozen program) events"; fi
+  n=$(cnt 'soft lockup|hard lockup|watchdog: BUG|rcu_(sched|preempt).*stall|rcu: INFO' "$KLOG")
+  if (( n > 0 )); then
+    add_finding CRIT "$n CPU lockup / RCU stall event(s): a CPU got stuck inside the kernel - the classic 'whole system freezes'" "Update kernel, firmware/BIOS and VM tools; check the driver named in the evidence" \
+      "$(grep -Ei 'soft lockup|hard lockup|watchdog: BUG|rcu.*stall' "$KLOG" | tail -3 | cut -c1-150)"; FZ[kernel]=$((FZ[kernel]+4))
+  else good "No CPU lockups or RCU stalls"; fi
+  local dproc; dproc=$(ps -eo state,pid,wchan:28,comm --no-headers 2>/dev/null | awk '$1=="D"')
+  if [[ -n $dproc ]]; then
+    n=$(grep -c . <<<"$dproc")
+    add_finding WARN "$n process(es) stuck RIGHT NOW in uninterruptible wait (D state) - waiting for disk or NFS" "Look at WAITING-IN: nfs/rpc = network storage, io/blk = disk" "$(awk '{printf "PID %s %s waiting in %s\n",$2,$4,$3}' <<<"$dproc" | head -4)"; FZ[io]=$((FZ[io]+1))
+    grep -qiE 'nfs|rpc' <<<"$dproc" && FZ[nfs]=$((FZ[nfs]+2))
+  else good "No processes stuck in D state right now"; fi
+  if [[ -r /proc/pressure/cpu ]]; then
+    sub "Pressure stall (% of time programs had to wait, last 60 s)"
+    local r s f
+    for r in cpu memory io; do
+      read -r s f < <(psi "/proc/pressure/$r")
+      meter "$r pressure" "$s" "full stall: ${f}%"
+      if (( s >= 40 || f >= 10 )); then
+        add_finding CRIT "Severe $r pressure: programs were stalled ${s}% of the time (full stall ${f}%)" "This resource is starving the system - see the matching section" "/proc/pressure/$r: some avg60=$s full avg60=$f"
+        case $r in cpu) FZ[cpu]=$((FZ[cpu]+2));; memory) FZ[mem]=$((FZ[mem]+3));; io) FZ[io]=$((FZ[io]+3));; esac
+      elif (( s >= 15 )); then
+        add_finding WARN "Noticeable $r pressure (${s}% stall)" "" "/proc/pressure/$r: some avg60=$s"
+        case $r in cpu) FZ[cpu]=$((FZ[cpu]+1));; memory) FZ[mem]=$((FZ[mem]+1));; io) FZ[io]=$((FZ[io]+1));; esac
+      fi
+    done
+  else skip "Pressure stall info (needs kernel 4.20+)"; fi
+  if (( VM_SI + VM_SO >= 1000 )); then add_finding CRIT "Memory THRASHING: swapping ${VM_SI} KB/s in, ${VM_SO} KB/s out - the system freezes while it shuffles memory to disk" "Stop the memory hog (section 3) or add RAM" "vmstat si=$VM_SI so=$VM_SO"; FZ[mem]=$((FZ[mem]+3))
+  elif (( VM_SI + VM_SO >= 100 )); then add_finding WARN "Active swapping (${VM_SI}/${VM_SO} KB/s in/out)" "Memory is tight - see section 3" "vmstat si=$VM_SI so=$VM_SO"; FZ[mem]=$((FZ[mem]+1))
+  else good "No memory thrashing"; fi
+  (( OOM_N > 0 )) && FZ[mem]=$((FZ[mem]+1))
+  if (( QUICK )); then skip "iostat disk latency (quick mode)"
+  elif has_cmd iostat; then
+    run_spin "Measuring disk latency for 3 seconds..." iostat -dx 3 2
+    local slow
+    slow=$(awk '/^Device/{split("",rows); n=0; for(i=1;i<=NF;i++) h[$i]=i; next}
+                NF>3 {rows[++n]=$0}
+                END{for(k=1;k<=n;k++){split(rows[k],c," "); u=("%util" in h)?c[h["%util"]]:0;
+                    aw=0; if("await" in h) aw=c[h["await"]]; if("r_await" in h && c[h["r_await"]]+0>aw+0) aw=c[h["r_await"]]; if("w_await" in h && c[h["w_await"]]+0>aw+0) aw=c[h["w_await"]];
+                    if (u+0>=90 || aw+0>=100) printf "%s busy %s%%, latency %s ms\n", c[1], u, aw}}' <<<"$SPIN_OUT")
+    if [[ -n $slow ]]; then add_finding WARN "Disk(s) saturated or slow" "Find the IO-heavy process: iotop -o  (or pidstat -d 2)" "$slow"; FZ[io]=$((FZ[io]+2))
+    else good "Disk latency and utilization look normal"; fi
+  else skip "iostat disk latency - install 'sysstat' to enable"; fi
+  n=$(cnt 'scsi.*timeout|task abort|nvme.*(timeout|reset)|ata[0-9.]+: (hard resetting|SRST failed)' "$KLOG")
+  (( n > 0 )) && { add_finding CRIT "$n storage timeout/reset event(s): the disk stopped answering for a while = system freeze" "Check disk, controller, SAN path / multipath, VM datastore latency" "$(grep -Ei 'scsi.*timeout|task abort|nvme.*(timeout|reset)|hard resetting' "$KLOG" | tail -3 | cut -c1-150)"; FZ[io]=$((FZ[io]+3)); }
+  local tn; tn=$(num "$(rd /proc/sys/kernel/tainted)")   # kernel taint flags remember past trouble
+  if (( tn > 0 )); then
+    local tf=""
+    (( tn & 128 ))   && tf+="D=kernel died (Oops/BUG) earlier; "
+    (( tn & 16 ))    && tf+="M=machine check (hardware error); "
+    (( tn & 16384 )) && tf+="L=soft lockup happened; "
+    (( tn & 512 ))   && tf+="W=kernel warning issued; "
+    (( tn & 1 ))     && tf+="P=proprietary driver loaded; "
+    (( tn & 4096 ))  && tf+="O=out-of-tree driver loaded; "
+    if (( tn & (128|16|16384) )); then add_finding WARN "Kernel is 'tainted': it recorded a serious event since boot" "Read dmesg around the event; update kernel / drivers / firmware" "taint=$tn: $tf"; FZ[kernel]=$((FZ[kernel]+2))
+    else note "Kernel taint $tn: ${tf:-informational}"; fi
+  fi
+  if (( HAS_JOURNAL )); then
+    local nb prev
+    nb=$(journalctl --list-boots --no-pager 2>/dev/null | wc -l)
+    if (( nb > 1 )); then
+      prev=$(journalctl -b -1 -n 40 --no-pager -q -o short-iso 2>/dev/null)
+      if grep -Eq 'systemd-shutdown|Reached target.*(Shutdown|Power-Off|Reboot|Final Step|System Reboot)|Journal stopped|Stopping .*Journal|reboot: (Restarting|Power down)|Shutting down' <<<"$prev"; then
+        good "Previous boot ended with a clean shutdown/reboot"
+      else
+        printf '%s\n' "$prev" >"$EVID/previous-boot-last-lines.log"
+        add_finding CRIT "The previous boot ended WITHOUT a clean shutdown - crash, hard freeze, power loss or forced reset" "Read what happened just before: $EVID/previous-boot-last-lines.log" "$(tail -4 <<<"$prev" | cut -c1-150)"; FZ[kernel]=$((FZ[kernel]+2))
+      fi
+    else
+      add_finding WARN "The journal keeps only the current boot - crashes from before the last reboot are invisible" "Make the journal persistent" "journalctl --list-boots: 1 boot"
+      add_fix "Make the systemd journal persistent (keeps logs across reboots)" "mkdir -p /var/log/journal && systemd-tmpfiles --create --prefix /var/log/journal && systemctl restart systemd-journald" "[[ -d /var/log/journal ]]" safe
+    fi
+  fi
+  n=$(cnt 'watchdog did not stop|watchdog timeout|Watchdog timer expired|hardware watchdog' "$KLOG")
+  (( n > 0 )) && { add_finding WARN "Watchdog events ($n): the system was reset after it stopped responding" "Look at the previous-boot evidence" "$(grep -Ei 'watchdog' "$KLOG" | tail -2 | cut -c1-150)"; FZ[kernel]=$((FZ[kernel]+2)); }
+  if [[ -d /var/crash ]] && [[ -n $(ls -A /var/crash 2>/dev/null) ]]; then
+    add_finding WARN "Crash dumps exist in /var/crash - the system or an application crashed before" "ls -la /var/crash ; analyse kernel dumps with 'crash'" "$(ls -lt /var/crash 2>/dev/null | sed -n '2,4p')"; FZ[kernel]=$((FZ[kernel]+1))
+  fi
+  local m stuck=""
+  while read -r m; do to 5 stat -t "$m" >/dev/null 2>&1 || stuck="$stuck $m"; done < <(awk '$3 ~ /^(nfs|nfs4|cifs|smb3|smbfs|fuse\.sshfs|glusterfs|ceph)$/ {print $2}' /proc/mounts)
+  if [[ -n $stuck ]]; then
+    add_finding CRIT "Network mount(s) not responding:$stuck - anything touching them (even ls or df) hangs" "Fix the file server / network, or lazy-unmount the mount" "stat timed out after 5 s on:$stuck"; FZ[nfs]=$((FZ[nfs]+4))
+    for m in $stuck; do add_fix "Force lazy-unmount the hanging mount $m" "umount -f -l '$m'" "! mountpoint -q '$m'" risky; done
+  else good "No hanging network mounts (NFS/CIFS)"; fi
+  local thr tmax pmax fdu fdm ctc ctm
+  thr=$(num "$(awk '{split($4,a,"/"); print a[2]}' /proc/loadavg)")
+  tmax=$(num "$(rd /proc/sys/kernel/threads-max)"); pmax=$(num "$(rd /proc/sys/kernel/pid_max)")
+  (( pmax > 0 && tmax > pmax )) && tmax=$pmax
+  if (( tmax > 0 )); then
+    meter "Threads" $(( thr * 100 / tmax )) "$thr of $tmax"
+    (( thr * 100 / tmax >= 80 )) && { add_finding CRIT "Process/thread table almost full ($thr of $tmax) - new programs cannot start" "Find the process spawning threads: ps -eLf | awk '{print \$2}' | uniq -c | sort -rn | head" "threads=$thr max=$tmax"; FZ[limits]=$((FZ[limits]+3)); }
+  fi
+  read -r fdu _ fdm < <(rd /proc/sys/fs/file-nr); fdu=$(num "${fdu:-}"); fdm=$(num "${fdm:-}")
+  if (( fdm > 0 && fdm < 9000000000000000000 )); then
+    meter "Open files" $(( fdu * 100 / fdm )) "$fdu of $fdm"
+    (( fdu * 100 / fdm >= 80 )) && { add_finding CRIT "System-wide open files almost exhausted ($fdu of $fdm)" "sysctl -w fs.file-max=<bigger>" "file-nr: $fdu / $fdm"; FZ[limits]=$((FZ[limits]+2)); }
+  fi
+  if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
+    ctc=$(num "$(rd /proc/sys/net/netfilter/nf_conntrack_count)"); ctm=$(num "$(rd /proc/sys/net/netfilter/nf_conntrack_max)")
+    (( ctm > 0 )) && meter "Conntrack" $(( ctc * 100 / ctm )) "$ctc of $ctm tracked connections"
+  fi
+  n=$(cnt 'clocksource.*unstable|Marking clocksource|time jumped|clock skew' "$KLOG")
+  (( n > 0 )) && { add_finding WARN "Unstable clock source ($n): timers misbehave, can look like short freezes" "On VMs install guest tools; check the kernel clocksource" "$(grep -Ei 'clocksource' "$KLOG" | tail -2 | cut -c1-150)"; FZ[cpu]=$((FZ[cpu]+1)); }
+
+  sub "Freeze / hang verdict"                      # rank the causes by evidence points
+  local k s rank=0 col
+  mapfile -t FZ_ORDER < <(for k in "${!FZ[@]}"; do (( FZ[$k] > 0 )) && echo "${FZ[$k]} $k"; done | sort -rn | awk '{print $2}')
+  if (( ${#FZ_ORDER[@]} == 0 )); then printf '%s%s%s No signs of freezes or hangs in the last %s h.%s\n' "$PFX" "$GRN$B" "$S_OK" "$HOURS" "$R"
+  else
+    for k in "${FZ_ORDER[@]}"; do
+      s=${FZ[$k]}; rank=$((rank+1)); col=$YEL; (( rank == 1 )) && col=$RED
+      printf '%s%s#%d%s %s%s%s\n' "$PFX" "$col$B" "$rank" "$R" "$col" "${FZ_TXT[$k]}" "$R"
+      printf '%s   evidence %s %s(%d points)%s\n' "$PFX" "$(grad_bar $(( s >= 10 ? 100 : s * 10 )) 20)" "$GRY" "$s" "$R"
+    done
+  fi
+  return 0
+}
+
+# ============================================================================
+# 12. SECURITY & UPDATES
+# ============================================================================
+check_security() {
+  step "Security & updates"
+  local fails rootok sudof ips
+  fails=$(cnt 'failed password|invalid user|authentication failure' "$AUTHL")
+  ips=$(grep -Ei 'failed password|invalid user' "$AUTHL" | grep -Eo 'from [0-9a-fA-F:.]+' | awk '{print $2}' | sort | uniq -c | sort -rn | head -5 | awk '{print $2" tried "$1" times"}')
+  if (( fails >= 500 )); then add_finding CRIT "Brute-force attack: $fails failed logins in $HOURS h" "Install fail2ban; use SSH keys only (PasswordAuthentication no)" "$ips"
+  elif (( fails >= 30 )); then add_finding WARN "$fails failed login attempts in $HOURS h" "Consider fail2ban and key-only SSH" "$ips"
+  else good "Failed logins: $fails (normal)"; fi
+  rootok=$(cnt 'accepted .* for root from' "$AUTHL")
+  (( rootok > 0 )) && add_finding WARN "Direct root SSH logins happened ($rootok)" "Set 'PermitRootLogin no' in /etc/ssh/sshd_config and use sudo" "$(grep -Ei 'accepted .* for root from' "$AUTHL" | tail -2 | cut -c1-150)"
+  sudof=$(cnt 'sudo:.*(incorrect password|not in sudoers|authentication failure)' "$AUTHL")
+  (( sudof > 0 )) && add_finding WARN "$sudof failed sudo attempt(s)" "Check who tried: grep sudo $AUTHL" "$(grep -Ei 'sudo:.*(incorrect password|not in sudoers)' "$AUTHL" | tail -2 | cut -c1-150)"
+  if has_cmd getenforce; then
+    local se den; se=$(getenforce 2>/dev/null); kv "SELinux" "$se"
+    if [[ $se != Disabled ]] && (( IS_ROOT )); then
+      if has_cmd ausearch; then den=$(ausearch -m AVC,USER_AVC -ts today 2>/dev/null | grep -c 'type=AVC'); else den=$(grep -c 'avc:  denied' /var/log/audit/audit.log 2>/dev/null); fi
+      den=$(num "$den")
+      if (( den > 0 )); then add_finding WARN "SELinux blocked something $den time(s) today - a service may be failing because of it" "ausearch -m AVC -ts today | audit2why" \
+        "$(grep 'avc:  denied' /var/log/audit/audit.log 2>/dev/null | grep -Eo 'comm="[^"]+"' | sort | uniq -c | sort -rn | head -4)"
+      else good "No SELinux denials today"; fi
+    fi
+  fi
+  local aa; aa=$(cnt 'apparmor="DENIED"' "$KLOG")
+  (( aa > 0 )) && add_finding WARN "AppArmor blocked something $aa time(s)" "Check the profile (aa-status, /etc/apparmor.d)" "$(grep -Eo 'profile="[^"]+"' "$KLOG" | sort | uniq -c | sort -rn | head -4)"
+  if (( QUICK )); then skip "pending updates (quick mode)"
+  else
+    local up=0 sec=0 secfix=""
+    case $PKG in
+      apt-get)
+        run_spin "Checking pending updates (apt)..." bash -c 'apt list --upgradable 2>/dev/null'
+        up=$(grep -c 'upgradable' <<<"$SPIN_OUT"); sec=$(grep -c -- '-security' <<<"$SPIN_OUT")
+        local stamp=/var/lib/apt/periodic/update-success-stamp; [[ -f $stamp ]] || stamp=/var/cache/apt/pkgcache.bin
+        [[ -f $stamp ]] && note "Package lists last refreshed: $(date -r "$stamp" '+%Y-%m-%d %H:%M')  (run 'apt update' for fresh numbers)"
+        if has_cmd unattended-upgrade; then secfix="unattended-upgrade -v"; else secfix="apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y upgrade"; fi ;;
+      dnf|yum)
+        run_spin "Checking pending updates ($PKG)..." to 120 "$PKG" -q check-update
+        up=$(grep -cE '^[[:alnum:]_.+-]+\.(x86_64|noarch|aarch64|i686|ppc64le|s390x)[[:space:]]' <<<"$SPIN_OUT")
+        run_spin "Checking security advisories ($PKG)..." to 120 "$PKG" -q updateinfo list --security
+        sec=$(grep -cE 'Sec|RHSA|ALSA|RLSA|ELSA|FEDORA' <<<"$SPIN_OUT"); secfix="$PKG -y upgrade --security" ;;
+      zypper)
+        run_spin "Checking pending updates (zypper)..." to 120 zypper -q lu
+        up=$(grep -c '^v ' <<<"$SPIN_OUT"); secfix="zypper -n patch --category security" ;;
+    esac
+    up=$(num "$up"); sec=$(num "$sec")
+    if (( sec > 0 )); then
+      add_finding WARN "$sec security update(s) pending ($up updates in total)" "$secfix" "$PKG reports $sec security / $up total"
+      add_fix "Install pending security updates (services may restart)" "$secfix" "" care
+    elif (( up > 0 )); then info "$up normal update(s) pending, no security updates"
+    else good "System is up to date"; fi
+  fi
+  if [[ -f /var/run/reboot-required ]]; then
+    add_finding WARN "A reboot is required to finish installing updates" "Plan a reboot" "$(tr '\n' ' ' </var/run/reboot-required.pkgs 2>/dev/null | cut -c1-120)"
+  elif has_cmd needs-restarting && (( IS_ROOT )); then
+    needs-restarting -r >/dev/null 2>&1 || add_finding WARN "A reboot is required to load updated core packages (kernel / glibc / systemd)" "Plan a reboot" "needs-restarting -r"
+  fi
+  if has_cmd openssl; then
+    local c exp_n=0 soon_n=0 nf=0
+    while IFS= read -r c; do
+      openssl x509 -in "$c" -noout 2>/dev/null || continue
+      nf=$((nf+1))
+      if ! openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1; then add_finding CRIT "Certificate EXPIRED: $c" "Renew it (certbot renew / ipa-getcert / your CA)" "$(openssl x509 -in "$c" -noout -subject -enddate 2>/dev/null)"; exp_n=$((exp_n+1))
+      elif ! openssl x509 -in "$c" -noout -checkend $((30*86400)) >/dev/null 2>&1; then add_finding WARN "Certificate expires within 30 days: $c" "Renew it soon" "$(openssl x509 -in "$c" -noout -subject -enddate 2>/dev/null)"; soon_n=$((soon_n+1)); fi
+    done < <(find /etc/ssl /etc/pki /etc/letsencrypt/live /etc/nginx /etc/httpd /etc/apache2 /etc/ipa -maxdepth 4 \
+               \( -name '*.crt' -o -name '*.pem' -o -name '*.cer' \) -not -path '*/ca-certificates/*' -not -path '/etc/ssl/certs/*' \
+               -not -path '*/ca-trust/*' -not -path '*/pki/tls/certs/ca-bundle*' -not -name '*key*' 2>/dev/null | head -300)
+    (( exp_n == 0 && soon_n == 0 )) && good "Certificates checked: $nf, none expiring within 30 days"
+  fi
+}
+
+# ============================================================================
+# 13. RECENT CHANGES
+# ============================================================================
+check_changes() {
+  step "Recent changes"
+  local cutoff ch="" n
+  cutoff=$(date -d '-7 days' +%F 2>/dev/null || echo 0000-00-00)
+  if [[ -r /var/log/dpkg.log ]]; then              # Debian: package history
+    ch=$(cat /var/log/dpkg.log.1 /var/log/dpkg.log 2>/dev/null | awk -v d="$cutoff" '$1>=d && $3 ~ /^(install|upgrade|remove|purge)$/ {printf "%s %s  %-8s %s\n",$1,substr($2,1,5),$3,$4}' | tail -15)
+    sub "Packages changed in the last 7 days (newest last)"
+  elif has_cmd rpm; then                           # RedHat: newest installs
+    ch=$(rpm -qa --last 2>/dev/null | head -15 | awk '{n=$1; $1=""; printf "%-45s %s\n", substr($0,2,40), n}')
+    sub "Most recently installed / updated packages"
+  fi
+  if [[ -n $ch ]]; then printf '%s\n' "$ch" | table_rows; n=$(grep -c . <<<"$ch"); else n=0; info "No package changes found"; fi
+  local etc; etc=$(find /etc -xdev -type f -mmin -$(( HOURS * 60 )) ! -name '*.backup*' ! -name '*.cache' ! -path '/etc/ld.so.cache' -printf '%TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null | sort | tail -15)
+  sub "Config files in /etc changed in the last $HOURS h"
+  if [[ -n $etc ]]; then printf '%s\n' "$etc" | table_rows; else ok "No config file changes"; fi
+  local run new; run=$(uname -r)
+  new=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's#/boot/vmlinuz-##' | grep -v rescue | sort -V | tail -1)
+  if [[ -n $new && $new != "$run" ]]; then add_finding INFO "A newer kernel ($new) is installed but $run is running" "Reboot to use the new kernel" "running $run, newest installed $new"
+  else good "Running the newest installed kernel ($run)"; fi
+  if (( (N_CRIT + N_WARN) > 0 )) && { (( n > 0 )) || [[ -n $etc ]]; }; then
+    add_finding INFO "Problems were found AND the system changed recently - check whether a change above caused them" "Compare the time a problem started with the change list above" "$(printf '%s\n%s' "$ch" "$etc" | grep . | tail -3)"
+  fi
+}
+
+# ============================================================================
+#  SUMMARY DASHBOARD
+# ============================================================================
+DIG=("╔═╗" "║ ║" "╚═╝"  "╔╗ " " ║ " "═╩═"  "╔═╗" "╔═╝" "╚══"  "╔═╗" " ═╣" "╚═╝"  "╦ ╦" "╚═╣" "  ╩"
+     "╔══" "╚═╗" "╚═╝"  "╔═╗" "╠═╗" "╚═╝"  "══╗" "  ║" "  ╩"  "╔═╗" "╠═╣" "╚═╝"  "╔═╗" "╚═╣" "╚═╝")   # 3-line digits 0-9
+big_num() {                                        # print a number with big box-drawing digits: NUMBER COLOR
+  local s=$1 col=$2 r i line
+  if (( ! UTF )); then printf '      %s%s%s\n' "$col$B" "$s" "$R"; return; fi
+  for r in 0 1 2; do
+    line=""; for ((i=0; i<${#s}; i++)); do line+="${DIG[$(( ${s:i:1} * 3 + r ))]} "; done
+    printf '      %s%s%s\n' "$col$B" "$line" "$R"
+  done
+}
+calc_score() { local c=0 w=0 i; for ((i=0; i<${#F_SEV[@]}; i++)); do
+  [[ ${F_STATUS[i]} == FIXED || ${F_STATUS[i]} == APPLIED ]] && continue    # solved problems no longer count
+  [[ ${F_SEV[i]} == CRIT ]] && c=$((c+1)); [[ ${F_SEV[i]} == WARN ]] && w=$((w+1)); done
+  local s=$(( 100 - c * 15 - w * 5 )); (( s < 0 )) && s=0; echo "$s"; }
+score_label() { if (( $1 >= 85 )); then echo "HEALTHY"; elif (( $1 >= 60 )); then echo "NEEDS ATTENTION"; else echo "CRITICAL"; fi; }
+score_col()   { if (( $1 >= 85 )); then echo "$GRN"; elif (( $1 >= 60 )); then echo "$YEL"; else echo "$RED"; fi; }
+
+summary() {
+  step_end
+  SCORE=$(calc_score); SCORE_AFTER=$SCORE
+  local col; col=$(score_col "$SCORE")
+  echo; echo
+  printf '  %s%s [SUMMARY] HEALTH REPORT %s%s\n' "$(c256 201)$B" "$(rep "$HL" 3)" "$(rep "$HL" 44)" "$R"
+  echo
+  printf '  %sSECTION                                  %s     %s     %s    STATUS%s\n' "$GRY$B" "$S_OK" "$S_WARN" "$S_FAIL" "$R"   # scoreboard
+  local i st sc
+  for ((i=1; i<=${#STEP_TITLES[@]}; i++)); do
+    if (( ${S_C[i]:-0} > 0 )); then st="CRITICAL"; sc=$RED; elif (( ${S_W[i]:-0} > 0 )); then st="WARNING"; sc=$YEL; else st="OK"; sc=$GRN; fi
+    printf '  %2d %s %-36.36s %s%4d%s  %s%4d%s  %s%4d%s    %s%s %s%s\n' "$i" "${STEP_ICON[i]:-}" "${STEP_TITLES[i-1]}" \
+      "$GRN" "${S_O[i]:-0}" "$R" "$YEL" "${S_W[i]:-0}" "$R" "$RED" "${S_C[i]:-0}" "$R" "$sc$B" "$( ((UTF)) && echo '●' || echo '*')" "$st" "$R"
+  done
+  echo
+  printf '  %s%s%s%s\n' "$col" "$DB_TL" "$(rep "$DB_H" 70)" "$R"
+  printf '  %s%s%s  %sHEALTH SCORE%s\n' "$col" "$DB_V" "$R" "$col$B" "$R"
+  big_num "$SCORE" "$col" | sed "s/^/  ${col}${DB_V}${R}/"
+  printf '  %s%s%s  %s  %s%s%s\n' "$col" "$DB_V" "$R" "$(grad_bar "$SCORE" 50 1)" "$col$B" "$(score_label "$SCORE")" "$R"
+  printf '  %s%s%s  %s%s %d critical%s   %s%s %d warnings%s   %s%s %d passed%s   %s%s %d tips%s\n' "$col" "$DB_V" "$R" \
+    "$RED$B" "$S_FAIL" "$N_CRIT" "$R" "$YEL$B" "$S_WARN" "$N_WARN" "$R" "$GRN$B" "$S_OK" "$N_OK" "$R" "$CYN" "$S_TIP" "$N_INFO" "$R"
+  printf '  %s%s%s%s\n' "$col" "$DB_BL" "$(rep "$DB_H" 70)" "$R"
+  if (( N_CRIT + N_WARN > 0 )); then
+    echo; printf '  %s%s FIX THESE FIRST%s\n' "$ORG$B" "$S_INFO" "$R"
+    local shown=0 sev
+    for sev in CRIT WARN; do
+      for ((i=0; i<${#F_SEV[@]}; i++)); do
+        [[ ${F_SEV[i]} == "$sev" ]] || continue
+        shown=$((shown+1)); (( shown > 15 )) && break 2
+        if [[ $sev == CRIT ]]; then printf '  %s%2d. %s %-10s%s %s\n' "$RED$B" "$shown" "$S_FAIL" "[${F_AREA[i]%% *}]" "$R" "${F_MSG[i]}"
+        else printf '  %s%2d. %s %-10s%s %s\n' "$YEL$B" "$shown" "$S_WARN" "[${F_AREA[i]%% *}]" "$R" "${F_MSG[i]}"; fi
+        [[ -n ${F_HINT[i]} ]] && printf '        %s%s %s%s\n' "$DIM" "$S_INFO" "${F_HINT[i]}" "$R"
+      done
+    done
+    (( N_CRIT + N_WARN > 15 )) && printf '  %s...and %d more - see the full report%s\n' "$GRY" $(( N_CRIT + N_WARN - 15 )) "$R"
+  else
+    echo; printf '  %s%s Everything looks good. Nothing to fix.%s\n' "$GRN$B" "$S_OK" "$R"
+  fi
+}
+
+# ============================================================================
+#  FIX MENU (pick fixes by number; each fix is verified afterwards)
+# ============================================================================
+SEL=()
+parse_sel() {                                      # "1,3,5-7" -> SEL=(0 2 4 5 6)
+  SEL=(); local tok a b k n=${#FX_CMD[@]}
+  set -f                                           # no filename globbing while splitting user input
+  for tok in ${1//,/ }; do
+    if [[ $tok =~ ^([0-9]+)-([0-9]+)$ ]]; then a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+      for ((k=a; k<=b; k++)); do (( k >= 1 && k <= n )) && SEL+=($((k-1))); done
+    elif [[ $tok =~ ^[0-9]+$ ]]; then (( tok >= 1 && tok <= n )) && SEL+=($((tok-1)))
+    else printf '  %signored: %s%s\n' "$YEL" "$tok" "$R" >&2; fi
+  done
+  set +f
+}
+risk_col() { case $1 in safe) echo "$GRN";; care) echo "$YEL";; *) echo "$RED";; esac; }
+stat_col() { case $1 in FIXED) echo "$GRN";; APPLIED) echo "$CYN";; FAILED) echo "$RED";; SKIPPED) echo "$GRY";; *) echo "$YEL";; esac; }
+
+draw_menu() {                                      # the menu goes to the screen only (not into the report)
+  local i n=${#FX_CMD[@]} prob
+  {
+    echo
+    printf '  %s%s%s %s FIX MENU %s%s\n' "$GRN$B" "$DB_TL" "$(rep "$DB_H" 3)" "$S_FIX" "$(rep "$DB_H" 56)" "$R"
+    printf '  %s%s%s  %s%-4s %-7s %-9s %s%s\n' "$GRN" "$DB_V" "$R" "$GRY$B" "#" "RISK" "STATUS" "ACTION   (problem it solves)" "$R"
+    for ((i=0; i<n; i++)); do
+      prob=${F_MSG[${FX_F[i]}]}
+      printf '  %s%s%s  %s%-4s%s %s%-7s%s %s%-9s%s %s\n' "$GRN" "$DB_V" "$R" "$B" "$((i+1))" "$R" \
+        "$(risk_col "${FX_RISK[i]}")$B" "${FX_RISK[i]^^}" "$R" "$(stat_col "${FX_STATUS[i]}")" "${FX_STATUS[i],,}" "$R" "${FX_TITLE[i]}"
+      printf '  %s%s%s                       %s%s %s%s\n' "$GRN" "$DB_V" "$R" "$GRY" "$S_INFO" "${prob:0:80}" "$R"
+    done
+    printf '  %s%s%s%s\n' "$GRN" "$DB_BL" "$(rep "$DB_H" 70)" "$R"
+    printf '  %sSAFE%s = harmless  %sCARE%s = changes the system  %sRISKY%s = may interrupt services/access (asks twice)\n' "$GRN$B" "$R" "$YEL$B" "$R" "$RED$B" "$R"
+    printf '  Choose: numbers %s1,3,5-7%s  %s|%s  %sa%s = all SAFE fixes  %s|%s  %sq%s = finish\n' "$CYN$B" "$R" "$GRY" "$R" "$CYN$B" "$R" "$GRY" "$R" "$CYN$B" "$R"
+  } >&2
+}
+
+apply_fix() {                                      # run one fix, show + record the result, verify it
+  local i=$1 cmd=${FX_CMD[$1]} ver=${FX_VERIFY[$1]} risk=${FX_RISK[$1]} out rc rcol
+  if [[ ${FX_STATUS[i]} == FIXED ]]; then info "Fix #$((i+1)) is already done"; return; fi
+  rcol=$(risk_col "$risk")
+  echo
+  printf '  %s%s%s Fix #%d %s[%s]%s %s%s%s\n' "$CYN" "$BX_TL" "$R" $((i+1)) "$rcol$B" "${risk^^}" "$R" "$B" "${FX_TITLE[i]}" "$R"
+  printf '  %s%s%s %sProblem:%s %s\n' "$CYN" "$BX_V" "$R" "$GRY" "$R" "${F_MSG[${FX_F[i]}]}"
+  printf '  %s%s%s %sCommand:%s %s%s%s\n' "$CYN" "$BX_V" "$R" "$GRY" "$R" "$CYN" "$cmd" "$R"
+  if [[ $risk == risky ]] && ! ask "RISKY: this may interrupt services or network access. Really run it?"; then
+    FX_STATUS[i]=SKIPPED; FX_TIME[i]=$(date +%H:%M:%S)
+    printf '  %s%s%s %s%s skipped by you%s\n' "$CYN" "$BX_BL" "$R" "$GRY" "$S_DOT" "$R"; return
+  fi
+  run_spin "Applying fix #$((i+1))..." eval "$cmd"                              # runs in a sub-shell; helper functions are available
+  out=$SPIN_OUT; rc=$SPIN_RC; FIXES_RUN=$((FIXES_RUN+1))
+  [[ -n $out ]] && tail -12 <<<"$out" | awk -v c="$CYN" -v v="$BX_V" -v r="$R" -v d="$DIM" '{print "  " c v r "   " d substr($0,1,110) r}'
+  FX_OUT[i]=$(tail -40 <<<"$out"); FX_TIME[i]=$(date +%H:%M:%S)
+  if (( rc != 0 )); then
+    FX_STATUS[i]=FAILED; printf '  %s%s%s %s%s FAILED%s (exit code %d) - try another option or the manual hint\n' "$CYN" "$BX_BL" "$R" "$RED$B" "$S_FAIL" "$R" "$rc"
+  elif [[ -n $ver ]]; then
+    sleep 1                                        # give the system a moment
+    if ( eval "$ver" ) >/dev/null 2>&1; then
+      FX_STATUS[i]=FIXED; printf '  %s%s%s %s%s FIXED%s - verified: %s%s%s\n' "$CYN" "$BX_BL" "$R" "$GRN$B" "$S_OK" "$R" "$GRY" "$ver" "$R"
+    else
+      FX_STATUS[i]=FAILED; printf '  %s%s%s %s%s NOT SOLVED%s - command ran but the check still fails: %s%s%s\n' "$CYN" "$BX_BL" "$R" "$RED$B" "$S_FAIL" "$R" "$GRY" "$ver" "$R"
+    fi
+  else
+    FX_STATUS[i]=APPLIED; printf '  %s%s%s %s%s APPLIED%s - command succeeded\n' "$CYN" "$BX_BL" "$R" "$CYN$B" "$S_OK" "$R"
+  fi
+}
+
+update_status() {                                  # a finding is solved when one of its fixes worked
+  local i j
+  for ((i=0; i<${#F_SEV[@]}; i++)); do
+    F_STATUS[i]="OPEN"
+    for ((j=0; j<${#FX_F[@]}; j++)); do
+      (( FX_F[j] == i )) || continue
+      case ${FX_STATUS[j]} in
+        FIXED)   F_STATUS[i]="FIXED" ;;
+        APPLIED) [[ ${F_STATUS[i]} != FIXED ]] && F_STATUS[i]="APPLIED" ;;
+        FAILED)  [[ ${F_STATUS[i]} == OPEN || ${F_STATUS[i]} == SKIPPED ]] && F_STATUS[i]="FAILED" ;;
+        SKIPPED) [[ ${F_STATUS[i]} == OPEN ]] && F_STATUS[i]="SKIPPED" ;;
+      esac
+    done
+  done
+}
+
+fix_menu() {
+  local n=${#FX_CMD[@]} sel i
+  (( n > 0 )) || return 0
+  (( FIX_MODE == -1 )) && return 0                 # --no-fix
+  if (( ! IS_ROOT )); then echo; info "$n automatic fix(es) available - re-run with sudo to use the fix menu"; return 0; fi
+  if (( ! INTERACTIVE )); then echo; info "$n automatic fix(es) available - run interactively to use the fix menu"; return 0; fi
+  if (( FIX_MODE == 0 )); then echo; ask "$n automatic fix(es) are available. Open the fix menu?" || return 0; fi
+  echo
+  printf '  %s%s [AUTO-FIX] FIXES APPLIED %s%s\n' "$(c256 46)$B" "$(rep "$HL" 3)" "$(rep "$HL" 42)" "$R"
+  while true; do
+    draw_menu
+    printf '  %s>%s ' "$CYN$B" "$R" >&2
+    read -r sel </dev/tty 2>/dev/null || sel=q
+    case "$sel" in
+      q|Q|"") break ;;
+      a|A) SEL=(); for ((i=0; i<n; i++)); do [[ ${FX_RISK[i]} == safe && ${FX_STATUS[i]} != FIXED && ${FX_STATUS[i]} != APPLIED ]] && SEL+=("$i"); done ;;
+      *) parse_sel "$sel" ;;
+    esac
+    if (( ${#SEL[@]} == 0 )); then printf '  %sNothing selected.%s\n' "$YEL" "$R" >&2; continue; fi
+    for i in "${SEL[@]}"; do apply_fix "$i"; done
+  done
+  update_status
+  SCORE_AFTER=$(calc_score)
+  if (( FIXES_RUN > 0 )); then
+    echo
+    printf '  %sHealth score:%s %s%d%s %s %s%d%s  %s(%s)%s\n' "$B" "$R" "$(score_col "$SCORE")$B" "$SCORE" "$R" "$S_INFO" \
+      "$(score_col "$SCORE_AFTER")$B" "$SCORE_AFTER" "$R" "$GRY" "$(score_label "$SCORE_AFTER")" "$R"
+  fi
+}
+
+# ============================================================================
+#  REPORTS: TXT + visual HTML
+# ============================================================================
+json_esc() { printf '%s' "$1" | tr -d '\000-\010\013-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's#</#<\\/#g' | awk 'NR>1{printf "\\n"} {printf "%s",$0}'; }   # text -> JSON string body
+js() { printf '"%s"' "$(json_esc "$1")"; }         # quoted JSON string
+
+build_json() {
+  local i
+  printf '{"meta":{"host":%s,"os":%s,"kernel":%s,"virt":%s,"uptime":%s,"date":%s,"hours":%d,"dur":%d,"before":%d,"after":%d,"passed":%d,"fixesRun":%d,"author":%s,"version":%s,"family":%s,"evid":%s,"laptop":%s},' \
+    "$(js "$HOST")" "$(js "$OS_NAME")" "$(js "$(uname -r)")" "$(js "$VIRT")" "$(js "$UP_H")" "$(js "$(date '+%Y-%m-%d %H:%M %Z')")" \
+    "$HOURS" $((SECONDS - START_SEC)) "$SCORE" "$SCORE_AFTER" "$N_OK" "$FIXES_RUN" "$(js "$AUTHOR")" "$(js "$VERSION")" "$(js "$FAMILY")" "$(js "$EVID")" \
+    "$( ((IS_LAPTOP)) && echo true || echo false)"
+  printf '"sections":['
+  for ((i=0; i<${#STEP_TITLES[@]}; i++)); do (( i )) && printf ','
+    printf '{"n":%d,"title":%s,"icon":%s,"crit":%d,"warn":%d,"ok":%d}' $((i+1)) "$(js "${STEP_TITLES[i]}")" "$(js "${HICON[i+1]}")" "${S_C[i+1]:-0}" "${S_W[i+1]:-0}" "${S_O[i+1]:-0}"; done
+  printf '],"findings":['
+  for ((i=0; i<${#F_SEV[@]}; i++)); do (( i )) && printf ','
+    printf '{"id":%d,"sev":%s,"area":%s,"step":%d,"msg":%s,"hint":%s,"evid":%s,"status":%s}' "$i" "$(js "${F_SEV[i]}")" "$(js "${F_AREA[i]}")" "${F_STEP[i]}" \
+      "$(js "${F_MSG[i]}")" "$(js "${F_HINT[i]}")" "$(js "${F_EVID[i]}")" "$(js "${F_STATUS[i]}")"; done
+  printf '],"fixes":['
+  for ((i=0; i<${#FX_CMD[@]}; i++)); do (( i )) && printf ','
+    printf '{"id":%d,"f":%d,"title":%s,"cmd":%s,"verify":%s,"risk":%s,"status":%s,"time":%s,"out":%s}' "$i" "${FX_F[i]}" "$(js "${FX_TITLE[i]}")" "$(js "${FX_CMD[i]}")" \
+      "$(js "${FX_VERIFY[i]}")" "$(js "${FX_RISK[i]}")" "$(js "${FX_STATUS[i]}")" "$(js "${FX_TIME[i]}")" "$(js "${FX_OUT[i]}")"; done
+  printf '],"meters":['
+  for ((i=0; i<${#M_LABEL[@]}; i++)); do (( i )) && printf ','
+    printf '{"area":%s,"label":%s,"val":%d,"extra":%s,"inv":%d}' "$(js "${M_AREA[i]}")" "$(js "${M_LABEL[i]}")" "${M_VAL[i]}" "$(js "${M_EXTRA[i]}")" "${M_INV[i]}"; done
+  printf '],"freeze":['
+  for ((i=0; i<${#FZ_ORDER[@]}; i++)); do (( i )) && printf ','
+    printf '{"k":%s,"score":%d,"text":%s}' "$(js "${FZ_ORDER[i]}")" "${FZ[${FZ_ORDER[i]}]}" "$(js "${FZ_TXT[${FZ_ORDER[i]}]}")"; done
+  printf '],"fans":['
+  for ((i=0; i<${#FAN_L[@]}; i++)); do (( i )) && printf ','; printf '{"label":%s,"rpm":%d}' "$(js "${FAN_L[i]}")" "${FAN_R[i]}"; done
+  printf '],"temps":['
+  for ((i=0; i<${#TEMP_L[@]}; i++)); do (( i )) && printf ','; printf '{"label":%s,"c":%d,"crit":%d}' "$(js "${TEMP_L[i]}")" "${TEMP_C[i]}" "${TEMP_X[i]}"; done
+  printf '],"battery":%s,"zombies":[' "$BAT_JSON"
+  for ((i=0; i<${#ZB_PP[@]}; i++)); do (( i )) && printf ','
+    printf '{"ppid":%d,"app":%s,"cmd":%s,"unit":%s,"count":%d,"oldest":%s,"pkg":%s,"user":%s}' "${ZB_PP[i]}" "$(js "${ZB_APP[i]}")" "$(js "${ZB_CMD[i]}")" \
+      "$(js "${ZB_UNIT[i]}")" "${ZB_CNT[i]}" "$(js "${ZB_OLD[i]}")" "$(js "${ZB_PKG[i]}")" "$(js "${ZB_USER[i]}")"; done
+  printf ']}'
+}
+
+build_details() {                                  # split the text report into collapsible sections (server-side, HTML-escaped)
+  local titles; titles=$(IFS='|'; echo "${STEP_TITLES[*]}")
+  awk -v titles="$titles" '
+    BEGIN { n = split(titles, T, "|"); open = 0 }
+    {
+      line = $0; gsub(/&/, "\\&amp;", line); gsub(/</, "\\&lt;", line); gsub(/>/, "\\&gt;", line)
+      if (line ~ /^  (╭|\+)(━━━|===) \[[0-9]+\/[0-9]+\]/ && match(line, /\[[0-9]+\/[0-9]+\]/)) {
+        num = substr(line, RSTART + 1, index(substr(line, RSTART), "/") - 2) + 0
+        if (open) print "</pre></details>"
+        printf "<details id=\"sec-%d\"><summary>%d. %s</summary><pre>\n", num, num, T[num]; open = 1; next
+      }
+      if (line ~ /^  (━━━|===) \[SUMMARY\]/)  { if (open) print "</pre></details>"; print "<details id=\"sec-summary\"><summary>Summary (text)</summary><pre>"; open = 1; next }
+      if (line ~ /^  (━━━|===) \[AUTO-FIX\]/) { if (open) print "</pre></details>"; print "<details id=\"sec-fixes\"><summary>Fix session log</summary><pre>"; open = 1; next }
+      sub(/^  (│|\|) ?/, "", line)                  # drop the left rail
+      if (open) print line
+    }
+    END { if (open) print "</pre></details>" }' "$TXT"
+}
+
+build_html() {
+  cat <<'HTMLHEAD'
+<!doctype html>
+<html lang="en" data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Linux Doctor</title>
+<style>
+:root{--bg:#0b0f17;--bg2:#111827;--card:#151c2b;--line:#263045;--fg:#e8edf6;--mut:#8f9bb3;--red:#ff5d6c;--yel:#f5b941;--grn:#3ddc84;--blu:#4cc2ff;--acc:#b06cff;--pnk:#ff6ec7;--sh:0 10px 30px #0006}
+[data-theme=light]{--bg:#f3f5fa;--bg2:#e9edf5;--card:#ffffff;--line:#dde3ee;--fg:#1a2233;--mut:#5f6b82;--sh:0 8px 24px #1a223314}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:radial-gradient(1200px 600px at 10% -10%,#4cc2ff18,transparent),radial-gradient(1000px 600px at 110% 0%,#b06cff1c,transparent),var(--bg);color:var(--fg);font:15px/1.55 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1180px;margin:auto;padding:0 18px 40px}
+.topbar{position:sticky;top:0;z-index:9;display:flex;gap:10px;align-items:center;padding:12px 18px;background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.brand{font-weight:800;letter-spacing:3px;background:linear-gradient(90deg,var(--blu),var(--acc),var(--pnk));-webkit-background-clip:text;background-clip:text;color:transparent}
+.sp{flex:1}.topbar a{color:var(--mut);text-decoration:none;font-size:13px}.topbar a:hover{color:var(--fg)}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:9px;padding:6px 12px}button:hover{border-color:var(--acc)}
+.hero{margin:22px 0;border-radius:22px;padding:30px;display:flex;gap:34px;align-items:center;flex-wrap:wrap;background:linear-gradient(125deg,#0b4a6e,#3a1f78 55%,#7a1f63);color:#fff;box-shadow:var(--sh);position:relative;overflow:hidden}
+.hero:after{content:"";position:absolute;inset:auto -60px -120px auto;width:360px;height:360px;border-radius:50%;background:#ffffff10}
+.hero h1{margin:0 0 4px;font-size:34px;letter-spacing:.5px}.hero p{margin:3px 0;color:#dfe6f5}.hero .credit{margin-top:12px;color:#ffd1ec;font-weight:600}
+.verdict{display:inline-block;margin-top:8px;padding:4px 14px;border-radius:99px;font-weight:800;letter-spacing:1px;background:#0004}
+.rings{display:flex;align-items:center;gap:16px}.arrow{font-size:28px;opacity:.8}
+.ring{width:140px;height:140px;border-radius:50%;background:conic-gradient(var(--c) calc(var(--p)*1%),#ffffff26 0);display:grid;place-items:center;animation:pop .8s ease-out}
+.ring>div{width:112px;height:112px;border-radius:50%;background:#141a2a;display:grid;place-items:center;text-align:center}
+.ring b{font-size:38px;line-height:1}.ring small{display:block;font-size:11px;color:#aab4c8;text-transform:uppercase;letter-spacing:1px}
+@keyframes pop{from{transform:scale(.6);opacity:0}to{transform:none;opacity:1}}
+@keyframes up{from{transform:translateY(12px);opacity:0}to{transform:none;opacity:1}}
+h2{margin:34px 0 12px;font-size:20px;display:flex;align-items:center;gap:10px}h2:before{content:"";width:6px;height:22px;border-radius:3px;background:linear-gradient(var(--blu),var(--acc))}
+h2 small{font-size:12px;background:var(--bg2);color:var(--mut);padding:2px 9px;border-radius:99px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:var(--sh);animation:up .5s both;position:relative;overflow:hidden}
+.kpi b{font-size:34px;display:block;line-height:1.1}.kpi span{color:var(--mut);font-size:13px}
+.kpi:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px}
+.kpi.crit b,.kpi.crit:before{color:var(--red);background:var(--red)}.kpi.warn b{color:var(--yel)}.kpi.warn:before{background:var(--yel)}
+.kpi.ok b{color:var(--grn)}.kpi.ok:before{background:var(--grn)}.kpi.fixed b{color:var(--blu)}.kpi.fixed:before{background:var(--blu)}.kpi.info b{color:var(--acc)}.kpi.info:before{background:var(--acc)}
+.kpi.crit b{background:none}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(205px,1fr));gap:12px}
+.tile{display:flex;flex-direction:column;gap:6px;padding:14px;border-radius:14px;background:var(--card);border:1px solid var(--line);color:var(--fg);text-decoration:none;transition:.2s;animation:up .5s both}
+.tile:hover{transform:translateY(-3px);box-shadow:var(--sh)}.tile .ic{font-size:24px}.tile .tt{font-weight:600}
+.tile.crit{border-color:#ff5d6c88;background:linear-gradient(160deg,#ff5d6c22,var(--card) 60%)}.tile.warn{border-color:#f5b94188;background:linear-gradient(160deg,#f5b94122,var(--card) 60%)}.tile.ok{background:linear-gradient(160deg,#3ddc8414,var(--card) 60%)}
+.cn{display:flex;gap:6px}.cn i{font-style:normal;font-size:12px;padding:1px 8px;border-radius:99px;background:var(--bg2)}.cn .c{color:var(--red)}.cn .w{color:var(--yel)}.cn .o{color:var(--grn)}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.chip{border-radius:99px;font-size:13px}.chip.on{background:linear-gradient(90deg,var(--blu),var(--acc));color:#fff;border-color:transparent}
+.f{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--mut);border-radius:16px;padding:18px 20px;margin:12px 0;box-shadow:var(--sh);animation:up .45s both}
+.f.crit{border-left-color:var(--red)}.f.warn{border-left-color:var(--yel)}.f.info{border-left-color:var(--acc)}
+.f.solved{border-left-color:var(--grn);background:linear-gradient(90deg,#3ddc8412,var(--card) 40%)}
+.fh{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.f h3{margin:10px 0 12px;font-size:17px}
+.badge,.st,.risk{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;font-weight:700}
+.badge.crit{background:#ff5d6c26;color:var(--red)}.badge.warn{background:#f5b94126;color:var(--yel)}.badge.info{background:#b06cff26;color:var(--acc)}
+.area{color:var(--mut);font-size:13px}.fh .st{margin-left:auto}
+.st.open{background:var(--bg2);color:var(--mut)}.st.fixed{background:#3ddc8426;color:var(--grn)}.st.applied{background:#4cc2ff26;color:var(--blu)}.st.failed{background:#ff5d6c26;color:var(--red)}.st.skipped{background:var(--bg2);color:var(--mut)}
+.risk.safe{background:#3ddc8420;color:var(--grn)}.risk.care{background:#f5b94120;color:var(--yel)}.risk.risky{background:#ff5d6c20;color:var(--red)}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:760px){.cols{grid-template-columns:1fr}.hero{padding:22px}}
+h4{margin:6px 0 8px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.8px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12.5px/1.5 "JetBrains Mono",ui-monospace,Consolas,monospace}
+.ev{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;max-height:220px;overflow:auto}
+.cmd{display:flex;gap:8px;align-items:flex-start;background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:10px 12px;color:#b8f5cf}
+[data-theme=light] .cmd{background:#0f172a}
+.cmd code{flex:1;font:12.5px/1.5 ui-monospace,Consolas,monospace;word-break:break-all}.cp{padding:2px 10px;font-size:12px}
+.fx{list-style:none;padding:0;margin:0}.fx li{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px 0;border-bottom:1px dashed var(--line);font-size:14px}.fx li:last-child{border:0}
+.res{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}.rs{padding:10px 12px;border-radius:10px;background:var(--bg2);margin:6px 0;font-size:14px}
+.rs.fixed{box-shadow:inset 3px 0 var(--grn)}.rs.failed{box-shadow:inset 3px 0 var(--red)}.rs.applied{box-shadow:inset 3px 0 var(--blu)}.rs.skipped{box-shadow:inset 3px 0 var(--mut)}
+.rs code{font:12px ui-monospace,Consolas,monospace;color:var(--blu)}.vf{color:var(--mut);font-size:13px;margin-top:4px}
+.mut{color:var(--mut)}.empty{padding:30px;text-align:center;font-size:18px;background:var(--card);border-radius:16px;border:1px dashed var(--grn)}
+.tl{list-style:none;padding:0;margin:0;position:relative}.tl:before{content:"";position:absolute;left:78px;top:6px;bottom:6px;width:2px;background:var(--line)}
+.tl li{display:flex;gap:30px;align-items:flex-start;margin:12px 0;position:relative}.tl time{width:64px;flex:none;color:var(--mut);font:13px ui-monospace,monospace;padding-top:12px}
+.tl li:before{content:"";position:absolute;left:72px;top:14px;width:14px;height:14px;border-radius:50%;background:var(--mut);border:3px solid var(--bg)}
+.tl li.fixed:before{background:var(--grn)}.tl li.failed:before{background:var(--red)}.tl li.applied:before{background:var(--blu)}
+.tl li>div{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px}.tl p{margin:2px 0 6px;color:var(--mut);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:var(--sh)}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.g{display:grid;grid-template-columns:minmax(90px,150px) 1fr 54px;gap:10px;align-items:center;font-size:13px;margin:7px 0}
+.g span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.g b{text-align:right}
+.gb{height:10px;background:var(--bg2);border-radius:99px;overflow:hidden}.gb i{display:block;height:100%;border-radius:99px;animation:grow 1s ease-out}
+@keyframes grow{from{width:0!important}}
+.gx{font-size:11.5px;color:var(--mut);margin:-4px 0 6px}
+.fan-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px dashed var(--line)}.fan-row:last-child{border:0}.fan-row span{flex:1}
+.fan{width:38px;height:38px;fill:var(--blu)}.fan.spin{animation:rot linear infinite}.fan.dead{fill:var(--red)}@keyframes rot{to{transform:rotate(360deg)}}
+.batt{display:flex;align-items:center;gap:6px;margin:8px 0}.bt{position:relative;width:150px;height:46px;border:3px solid var(--fg);border-radius:9px;padding:3px}
+.bt:after{content:"";position:absolute;right:-9px;top:12px;width:6px;height:16px;background:var(--fg);border-radius:0 3px 3px 0}
+.bt i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,var(--grn),#9cf5c2)}.bt span{position:absolute;inset:0;display:grid;place-items:center;font-weight:800;mix-blend-mode:difference;color:#fff}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--mut);font-size:12px;text-transform:uppercase}
+.zc{display:inline-block;min-width:34px;text-align:center;padding:2px 8px;border-radius:99px;background:#ff5d6c26;color:var(--red);font-weight:800}
+.fz{display:flex;gap:14px;align-items:center;margin:10px 0}.rk{font-size:22px;font-weight:800;width:44px;color:var(--mut)}.fz>div{flex:1}.fz:first-child .rk{color:var(--red)}
+details{background:var(--card);border:1px solid var(--line);border-radius:12px;margin:8px 0;overflow:hidden}summary{cursor:pointer;padding:12px 16px;font-weight:600}summary:hover{background:var(--bg2)}
+details pre{padding:12px 16px;border-top:1px solid var(--line);color:var(--fg);max-height:520px;overflow:auto}
+footer{text-align:center;color:var(--mut);margin:40px 0 0;font-size:13px}footer b{background:linear-gradient(90deg,var(--blu),var(--pnk));-webkit-background-clip:text;background-clip:text;color:transparent}
+@media print{.topbar,.chips,.cp,button{display:none!important}body{background:#fff;color:#000}.f,.card,.kpi,.tile{box-shadow:none;break-inside:avoid}details{break-inside:avoid}details:not([open]) pre{display:block}}
+</style></head><body>
+<div id="app"></div>
+<noscript><p style="padding:20px">This report needs JavaScript for the visual view. The plain text version is next to this file (.txt).</p></noscript>
+HTMLHEAD
+  printf '<script id="data" type="application/json">'; build_json; printf '</script>\n'
+  printf '<div id="raw" hidden>\n'; build_details; printf '</div>\n'
+  cat <<'HTMLTAIL'
+<script>
+(function(){
+var D=JSON.parse(document.getElementById('data').textContent),m=D.meta;
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function col(s){return s>=85?'var(--grn)':s>=60?'var(--yel)':'var(--red)'}
+function lab(s){return s>=85?'HEALTHY':s>=60?'NEEDS ATTENTION':'CRITICAL'}
+var SEV={CRIT:['Critical','crit'],WARN:['Warning','warn'],INFO:['Tip','info']};
+var ST={OPEN:['Open','open'],FIXED:['Solved ✓','fixed'],APPLIED:['Fix applied','applied'],FAILED:['Fix did not solve it','failed'],SKIPPED:['Skipped','skipped']};
+var RISK={safe:'SAFE',care:'CAREFUL',risky:'RISKY'};
+function ring(v,l){return '<div class="ring" style="--p:'+v+';--c:'+col(v)+'"><div><span><b>'+v+'</b><small>'+l+'</small></span></div></div>'}
+function solved(s){return s==='FIXED'||s==='APPLIED'}
+document.title='Linux Doctor · '+m.host;
+var h='<div class="topbar"><span class="brand">LINUX DOCTOR</span><a href="#problems">Problems</a><a href="#areas">Areas</a><a href="#gauges">Gauges</a><a href="#details">Details</a><span class="sp"></span><button id="theme">◐ Theme</button><button id="print">⎙ Print / PDF</button></div><div class="wrap">';
+h+='<header class="hero"><div class="rings">'+ring(m.before,m.fixesRun?'before':'score')+(m.fixesRun?'<span class="arrow">➜</span>'+ring(m.after,'after fixes'):'')+'</div>';
+h+='<div><h1>'+esc(m.host)+'</h1><p>'+esc(m.os)+' · kernel '+esc(m.kernel)+' · '+esc(m.virt)+(m.laptop?' · laptop':'')+'</p>';
+h+='<p>'+esc(m.date)+' · logs of the last '+m.hours+' h · scan took '+m.dur+' s · up '+esc(m.uptime)+'</p>';
+h+='<span class="verdict" style="color:'+col(m.after)+'">'+lab(m.after)+'</span><p class="credit">Crafted with love by '+esc(m.author)+'</p></div></header>';
+function n(s){return D.findings.filter(function(f){return f.sev===s}).length}
+var fixedN=D.findings.filter(function(f){return solved(f.status)}).length;
+h+='<section class="kpis"><div class="kpi crit"><b>'+n('CRIT')+'</b><span>Critical problems</span></div><div class="kpi warn"><b>'+n('WARN')+'</b><span>Warnings</span></div><div class="kpi ok"><b>'+m.passed+'</b><span>Checks passed</span></div><div class="kpi fixed"><b>'+fixedN+'</b><span>Solved in this run</span></div><div class="kpi info"><b>'+n('INFO')+'</b><span>Tips</span></div></section>';
+h+='<h2 id="areas">Health by area</h2><section class="tiles">'+D.sections.map(function(s,i){var c=s.crit?'crit':s.warn?'warn':'ok';return '<a class="tile '+c+'" style="animation-delay:'+(i*40)+'ms" href="#sec-'+s.n+'" data-sec="'+s.n+'"><span class="ic">'+s.icon+'</span><span class="tt">'+s.n+'. '+esc(s.title)+'</span><span class="cn"><i class="c">✖ '+s.crit+'</i><i class="w">⚠ '+s.warn+'</i><i class="o">✔ '+s.ok+'</i></span></a>'}).join('')+'</section>';
+var cn={all:'All',CRIT:'Critical',WARN:'Warnings',INFO:'Tips',open:'Still open',fixed:'Solved'};
+h+='<h2 id="problems">Problems pinpointed <small>'+D.findings.length+'</small></h2><div class="chips">'+Object.keys(cn).map(function(k,i){return '<button class="chip'+(i?'':' on')+'" data-f="'+k+'">'+cn[k]+'</button>'}).join('')+'</div><section id="flist">';
+if(!D.findings.length)h+='<div class="empty">🎉 No problems found - this system is in great shape.</div>';
+var ord={CRIT:0,WARN:1,INFO:2};
+D.findings.slice().sort(function(a,b){return ord[a.sev]-ord[b.sev]}).forEach(function(f,idx){
+ var fx=D.fixes.filter(function(x){return x.f===f.id}),sv=SEV[f.sev]||SEV.WARN,st=ST[f.status]||ST.OPEN,ok=solved(f.status);
+ h+='<article class="f '+sv[1]+(ok?' solved':'')+'" style="animation-delay:'+Math.min(idx*35,600)+'ms" data-sev="'+f.sev+'" data-st="'+(ok?'fixed':'open')+'">';
+ h+='<div class="fh"><span class="badge '+sv[1]+'">'+sv[0]+'</span><span class="area">'+esc(f.area)+'</span><span class="st '+st[1]+'">'+st[0]+'</span></div><h3>'+esc(f.msg)+'</h3><div class="cols">';
+ h+='<div><h4>🔎 What was found</h4>'+(f.evid?'<pre class="ev">'+esc(f.evid)+'</pre>':'<p class="mut">See the details of section '+f.step+'.</p>')+'</div>';
+ h+='<div><h4>🛠 How to fix</h4>'+(f.hint?'<div class="cmd"><code>'+esc(f.hint)+'</code><button class="cp" data-c="'+esc(f.hint)+'">Copy</button></div>':'<p class="mut">No action needed.</p>');
+ if(fx.length)h+='<h4 style="margin-top:14px">⚙ Automatic fixes offered</h4><ul class="fx">'+fx.map(function(x){var s=ST[x.status]||ST.OPEN;return '<li><span class="risk '+x.risk+'">'+(RISK[x.risk]||x.risk)+'</span>'+esc(x.title)+' <span class="st '+s[1]+'">'+s[0]+'</span></li>'}).join('')+'</ul>';
+ h+='</div></div>';
+ var done=fx.filter(function(x){return x.status!=='OPEN'});
+ if(done.length)h+='<div class="res"><h4>✅ How it was solved</h4>'+done.map(function(x){var s=ST[x.status]||ST.OPEN;return '<div class="rs '+s[1]+'"><b>'+esc(x.time)+'</b> · '+esc(x.title)+' → <span class="st '+s[1]+'">'+s[0]+'</span><br><code>$ '+esc(x.cmd)+'</code>'+(x.verify?'<div class="vf">Verified with <code>'+esc(x.verify)+'</code> → '+(x.status==='FIXED'?'✔ passed':'✖ not passed')+'</div>':'')+(x.out?'<details><summary>Command output</summary><pre>'+esc(x.out)+'</pre></details>':'')+'</div>'}).join('')+'</div>';
+ h+='</article>';
+});
+h+='</section>';
+var tl=D.fixes.filter(function(x){return x.status!=='OPEN'});
+if(tl.length)h+='<h2>Resolution timeline <small>'+tl.length+' action(s)</small></h2><ol class="tl">'+tl.map(function(x){var s=ST[x.status]||ST.OPEN,f=D.findings[x.f]||{};return '<li class="'+s[1]+'"><time>'+esc(x.time)+'</time><div><b>'+esc(x.title)+'</b><p>Problem: '+esc(f.msg)+'</p><span class="st '+s[1]+'">'+s[0]+'</span></div></li>'}).join('')+'</ol>';
+if(D.zombies.length)h+='<h2>Zombie processes - who is causing them</h2><div class="card" style="overflow-x:auto"><table><tr><th>Parent PID</th><th>Application (the culprit)</th><th>Service</th><th>Zombies</th><th>Oldest</th><th>Package</th></tr>'+D.zombies.map(function(z){return '<tr><td>'+z.ppid+'</td><td><b>'+esc(z.app)+'</b> <span class="mut">('+esc(z.user)+')</span><br><small class="mut">'+esc(z.cmd)+'</small></td><td>'+esc(z.unit)+'</td><td><span class="zc">'+z.count+'</span></td><td>'+esc(z.oldest)+'</td><td>'+esc(z.pkg)+'</td></tr>'}).join('')+'</table></div>';
+var FAN='<path d="M12 10.6c-.4-3.4.5-7.3 3.2-7.6 2.4-.3 3 2.7 1.1 4.5-1.2 1.1-2.7 2.2-4.3 3.1zM13.4 12c3.4-.4 7.3.5 7.6 3.2.3 2.4-2.7 3-4.5 1.1-1.1-1.2-2.2-2.7-3.1-4.3zM12 13.4c.4 3.4-.5 7.3-3.2 7.6-2.4.3-3-2.7-1.1-4.5 1.2-1.1 2.7-2.2 4.3-3.1zM10.6 12c-3.4.4-7.3-.5-7.6-3.2-.3-2.4 2.7-3 4.5-1.1 1.1 1.2 2.2 2.7 3.1 4.3z"/><circle cx="12" cy="12" r="1.7"/>';
+if(D.fans.length||D.temps.length||D.battery){
+ h+='<h2>Cooling, fans &amp; battery</h2><section class="grid3">';
+ if(D.fans.length)h+='<div class="card"><h4>🌀 Fans</h4>'+D.fans.map(function(f){var d=f.rpm>0?Math.max(.12,1200/f.rpm).toFixed(2):0;return '<div class="fan-row"><svg class="fan'+(f.rpm>0?' spin':' dead')+'" style="animation-duration:'+d+'s" viewBox="0 0 24 24">'+FAN+'</svg><span>'+esc(f.label)+'</span><b>'+f.rpm+' RPM</b></div>'}).join('')+'</div>';
+ if(D.temps.length)h+='<div class="card"><h4>🌡 Temperatures</h4>'+D.temps.map(function(t){var p=Math.min(100,Math.round(t.c*100/(t.crit||100))),c=t.c>=t.crit-5?'var(--red)':t.c>=80?'var(--yel)':'var(--grn)';return '<div class="g"><span title="'+esc(t.label)+'">'+esc(t.label)+'</span><div class="gb"><i style="width:'+p+'%;background:'+c+'"></i></div><b>'+t.c+'°C</b></div>'}).join('')+'</div>';
+ if(D.battery){var b=D.battery;h+='<div class="card"><h4>🔋 Battery '+esc(b.name)+'</h4><div class="batt"><div class="bt"><i style="width:'+b.cap+'%"></i><span>'+b.cap+'%</span></div></div><p>'+esc(b.status)+' · charger '+(b.ac?'connected':'not connected')+'</p><div class="g"><span>Health</span><div class="gb"><i style="width:'+b.health+'%;background:'+(b.health<50?'var(--red)':b.health<75?'var(--yel)':'var(--grn)')+'"></i></div><b>'+b.health+'%</b></div><p class="mut">'+b.cycles+' charge cycles</p></div>'}
+ h+='</section>';
+}
+h+='<h2>Freeze / hang verdict</h2><div class="card">'+(D.freeze.length?D.freeze.map(function(z,i){return '<div class="fz"><span class="rk">#'+(i+1)+'</span><div><b>'+esc(z.text)+'</b><div class="gb" style="margin-top:6px"><i style="width:'+Math.min(100,z.score*10)+'%;background:'+(i?'var(--yel)':'var(--red)')+'"></i></div><small class="mut">'+z.score+' evidence points</small></div></div>'}).join(''):'<p>✔ No signs of freezes or hangs.</p>')+'</div>';
+var areas=[];D.meters.forEach(function(x){if(areas.indexOf(x.area)<0)areas.push(x.area)});
+h+='<h2 id="gauges">Gauges</h2><section class="grid3">'+areas.map(function(a){return '<div class="card"><h4>'+esc(a)+'</h4>'+D.meters.filter(function(x){return x.area===a}).map(function(x){var bad=x.inv?100-x.val:x.val,c=bad>=90?'var(--red)':bad>=70?'var(--yel)':'var(--grn)';return '<div class="g" title="'+esc(x.extra)+'"><span>'+esc(x.label)+'</span><div class="gb"><i style="width:'+Math.min(100,x.val)+'%;background:'+c+'"></i></div><b>'+x.val+'%</b></div><div class="gx">'+esc(x.extra)+'</div>'}).join('')+'</div>'}).join('')+'</section>';
+h+='<h2 id="details">Full details per area</h2><section id="det"></section>';
+h+='<footer>Linux Doctor v'+esc(m.version)+' · <b>Crafted with love by '+esc(m.author)+'</b><br>Evidence folder on the server: '+esc(m.evid)+'</footer></div>';
+document.getElementById('app').innerHTML=h;
+var raw=document.getElementById('raw'),det=document.getElementById('det');while(raw.firstChild)det.appendChild(raw.firstChild);
+function all(s){return Array.prototype.slice.call(document.querySelectorAll(s))}
+all('.chip').forEach(function(c){c.onclick=function(){all('.chip').forEach(function(x){x.classList.remove('on')});c.classList.add('on');var k=c.getAttribute('data-f');all('#flist .f').forEach(function(a){a.style.display=(k==='all'||a.getAttribute('data-sev')===k||a.getAttribute('data-st')===k)?'':'none'})}});
+all('.cp').forEach(function(b){b.onclick=function(){var t=b.getAttribute('data-c');function done(){b.textContent='Copied!';setTimeout(function(){b.textContent='Copy'},1500)}
+ function fb(){var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand('copy')}catch(e){}document.body.removeChild(ta);done()}
+ if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done,fb)}else fb()}});
+all('.tile').forEach(function(t){t.addEventListener('click',function(){var d=document.getElementById('sec-'+t.getAttribute('data-sec'));if(d)d.open=true})});
+var root=document.documentElement;document.getElementById('theme').onclick=function(){root.setAttribute('data-theme',root.getAttribute('data-theme')==='light'?'dark':'light')};
+document.getElementById('print').onclick=function(){all('details').forEach(function(d){d.open=true});window.print()};
+})();
+</script>
+</body></html>
+HTMLTAIL
+}
+
+finish() {
+  update_status                                    # make sure statuses are current
+  echo
+  printf '  %sFinished in %s.%s\n' "$GRY" "$(dur_h $((SECONDS - START_SEC)))" "$R"
+  exec 1>&3                                        # stop copying to the raw file (closes tee's input)
+  if [[ -n $TEE_PID ]]; then wait "$TEE_PID" 2>/dev/null || sleep 1; else sleep 1; fi
+  sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g; s/\r//g' "$RAW" >"$TXT"   # plain-text report = screen output without colors
+  build_html >"$HTML"                              # visual HTML report
+  local w=76
+  echo
+  printf '  %s%s%s%s%s\n' "$PNK" "$BX_TL" "$(rep "$BX_H" "$w")" "$BX_TR" "$R"
+  printf '  %s%s%s %s%s Reports saved%s\n' "$PNK" "$BX_V" "$R" "$B" "$S_OK" "$R"
+  printf '  %s%s%s   %sHTML%s  %s   %s(open in a browser)%s\n' "$PNK" "$BX_V" "$R" "$CYN$B" "$R" "$HTML" "$GRY" "$R"
+  printf '  %s%s%s   %sTXT %s  %s\n' "$PNK" "$BX_V" "$R" "$CYN$B" "$R" "$TXT"
+  printf '  %s%s%s   %sDATA%s  %s\n' "$PNK" "$BX_V" "$R" "$CYN$B" "$R" "$EVID"
+  printf '  %s%s%s\n' "$PNK" "$BX_V" "$R"
+  printf '  %s%s%s   %sCrafted with love by %s%s\n' "$PNK" "$BX_V" "$R" "$PNK" "$AUTHOR" "$R"
+  printf '  %s%s%s%s%s\n' "$PNK" "$BX_BL" "$(rep "$BX_H" "$w")" "$BX_BR" "$R"
+  echo
+}
+
+# ============================================================================
+#  MAIN
+# ============================================================================
+banner                                             # logo, credit, run info
+echo
+run_spin "Reading system logs (last $HOURS h)..." collect_logs
+printf '  %s%s%s Logs collected: %d kernel lines, %d error lines, %d login lines\n' "$BLU" "$S_INFO" "$R" "$(wc -l <"$KLOG")" "$(wc -l <"$ERRLOG")" "$(wc -l <"$AUTHL")"
+check_overview                                     #  1
+check_cpu                                          #  2
+check_memory                                       #  3
+check_disk                                         #  4
+check_hardware                                     #  5
+check_cooling                                      #  6
+check_processes                                    #  7
+check_services                                     #  8
+check_logs                                         #  9
+check_network                                      # 10
+check_freeze                                       # 11
+check_security                                     # 12
+check_changes                                      # 13
+summary                                            # scoreboard + score + fix-first list
+fix_menu                                           # pick fixes (interactive, root)
+finish                                             # write TXT + HTML
+SC=$(calc_score)                                   # exit code from the score after fixes
+if (( SC < 60 )) || [[ " ${F_SEV[*]:-} " == *" CRIT "* && $SC -lt 85 ]]; then exit 2; elif (( SC < 100 )); then exit 1; else exit 0; fi
